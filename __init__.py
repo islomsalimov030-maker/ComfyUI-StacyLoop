@@ -899,6 +899,48 @@ class StacyLoadVideo:
         return (out, int(out.shape[0]), fps, rep)
 
 
+class StacyColorLock:
+    """Colour lock of every frame to the keyframe: the same Reinhard transfer in Lab as KJNodes ColorMatchV2
+    'reinhard_lab_gpu' (per-frame mean/std matched to the reference), but done a few frames at a time on the GPU
+    and returned to the CPU - identical result, a few hundred MB of VRAM instead of 3-6 GB (no OOM on 24-32 GB
+    cards while the video model is still staged)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image_target": ("IMAGE",), "image_ref": ("IMAGE",),
+                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                             "chunk": ("INT", {"default": 16, "min": 1, "max": 256})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, image_target, image_ref, strength, chunk):
+        if strength <= 0:
+            return (image_target,)
+        import kornia
+        import comfy.model_management as mm
+        dev = mm.get_torch_device()
+        ref = image_ref[:1].to(dev).permute(0, 3, 1, 2).contiguous()
+        ref_lab = kornia.color.rgb_to_lab(ref[:, :3]).flatten(2)
+        ref_std, ref_mean = torch.std_mean(ref_lab, dim=-1, keepdim=True, unbiased=False)
+        B, H, W, C = image_target.shape
+        out = torch.empty((B, H, W, 3), dtype=torch.float32)
+        for i in range(0, B, chunk):
+            src = image_target[i:i + chunk, ..., :3].to(dev).permute(0, 3, 1, 2).float().contiguous()
+            lab = kornia.color.rgb_to_lab(src)
+            b = lab.shape[0]
+            flat = lab.view(b, 3, -1)
+            s_std, s_mean = torch.std_mean(flat, dim=-1, keepdim=True, unbiased=False)
+            flat = (flat - s_mean) * (ref_std / s_std.clamp_min(1e-6)) + ref_mean
+            rgb = kornia.color.lab_to_rgb(flat.view(b, 3, H, W))
+            res = (1.0 - strength) * src + strength * rgb
+            out[i:i + b] = res.permute(0, 2, 3, 1).clamp_(0, 1).cpu()
+            del src, lab, flat, rgb, res
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "StacyFitFrame": StacyFitFrame,
     "StacySigmas": StacySigmas,
@@ -916,6 +958,7 @@ NODE_CLASS_MAPPINGS = {
     "StacyPromptRetime": StacyPromptRetime,
     "StacyGate": StacyGate,
     "StacyLoadVideo": StacyLoadVideo,
+    "StacyColorLock": StacyColorLock,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyFitFrame": "Stacy · Fit frame (cover crop)",
@@ -934,4 +977,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyPromptRetime": "Stacy · Prompt length = duration",
     "StacyGate": "Stacy · Gate (mode switch)",
     "StacyLoadVideo": "Stacy · Load ready video (by name)",
+    "StacyColorLock": "Stacy · Colour lock to keyframe (low VRAM)",
 }
