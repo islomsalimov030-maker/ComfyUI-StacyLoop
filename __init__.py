@@ -644,8 +644,8 @@ class StacyControls:
                                  "tooltip": "On: generate from the keyframe + prompt. Off: only run the face pass on "
                                             "the video named in 'video' (nothing is generated)."}),
             "video": ("STRING", {"default": "stacy_h3/Stacy_00001.mp4", "multiline": False,
-                                 "tooltip": "FACE PASS mode only: the FullHD video to refine - a file name in ComfyUI's "
-                                            "output or input folder (e.g. stacy_h3/Stacy_00003.mp4) or a full path."}),
+                                 "tooltip": "FACE PASS mode only, used when nothing is uploaded in the 'VIDEO for face pass' node: a file "
+                                            "name in ComfyUI's output or input folder (e.g. stacy_h3/Stacy_00003.mp4) or a full path."}),
             "duration_sec": _sl("FLOAT", 8.0, 5.0, 10.0, 0.25,
                                 "Clip length. Snapped to H3's 17k+5 frame grid at 24 fps (7 s = 175, 8 s = 192, "
                                 "9 s = 209, 10 s = 243 frames). The report prints the exact length used."),
@@ -655,6 +655,11 @@ class StacyControls:
                                  "label_off": "entry clip (no loop)",
                                  "tooltip": "Off for the pose-entry clips (Standing-4 / Standing-9): no last-frame "
                                             "anchor, no loop seam; the last frame is saved for the next loop."}),
+            "end_frame": ("BOOLEAN", {"default": False, "label_on": "END FRAME image = last frame",
+                                      "label_off": "no end frame",
+                                      "tooltip": "Only when loop is OFF: anchor the last frame to the END FRAME image "
+                                                 "(first and last frame differ). With loop ON the keyframe is always "
+                                                 "the last frame and this switch is ignored."}),
             "steps": _sl("INT", 20, 8, 40, 1, "Sampling steps (official H3 scheme: 20, res_multistep)."),
             "shift": _sl("FLOAT", 12.0, 6.0, 16.0, 0.5,
                          "Sigma shift. 12 = official. Lower = more motion freedom / less adherence to the "
@@ -692,24 +697,24 @@ class StacyControls:
 
     RETURN_TYPES = ("INT", "FLOAT", "INT", "INT", "BOOLEAN", "INT", "FLOAT", "FLOAT", "INT", "BOOLEAN", "BOOLEAN",
                     "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "INT", "FLOAT", "FLOAT", "BOOLEAN", "BOOLEAN",
-                    "STRING")
+                    "STRING", "BOOLEAN")
     RETURN_NAMES = ("length", "seconds", "seed", "face_seed", "loop", "steps", "shift", "color_lock",
                     "seam_crossfade", "free_vram", "face_pass", "face_denoise", "face_lora", "large_face_mult",
                     "face_lock", "face_lock_temporal", "hand_strength", "stitch_feather", "face_confidence",
-                    "crop_factor", "generate", "video_mode", "video")
+                    "crop_factor", "generate", "video_mode", "video", "last_anchor")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
     def run(self, duration_sec, seed, loop, steps, shift, color_lock, seam_crossfade, free_vram, face_pass,
             face_denoise, face_lora, large_face_mult, face_lock, face_lock_temporal, hand_strength,
-            stitch_feather, face_confidence, crop_factor, mode=True, video=""):
+            stitch_feather, face_confidence, crop_factor, mode=True, video="", end_frame=False):
         k = max(1, round((float(duration_sec) * 24 - 5) / 17))
         n = min(max(17 * k + 5, 124), 362)
         return (n, round((n - 1) / 24.0, 2), int(seed), int(seed) + 17, bool(loop), int(steps), float(shift),
                 float(color_lock), int(seam_crossfade), bool(free_vram), bool(face_pass), float(face_denoise),
                 float(face_lora), float(large_face_mult), float(face_lock), float(face_lock_temporal),
                 float(hand_strength), int(stitch_feather), float(face_confidence), float(crop_factor),
-                bool(mode), not bool(mode), str(video))
+                bool(mode), not bool(mode), str(video), bool(loop) or bool(end_frame))
 
 
 class StacyFreeVRAM:
@@ -941,6 +946,84 @@ class StacyColorLock:
         return (out,)
 
 
+_VIDEO_EXT = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".gif")
+
+
+def _read_video(path):
+    import cv2
+    cap = cv2.VideoCapture(path)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+    frames = []
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frames.append(torch.from_numpy(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
+    cap.release()
+    if not frames:
+        raise ValueError(f"no frames decoded from {path}")
+    return torch.stack(frames).float().div_(255.0), fps
+
+
+class StacyVideoInput:
+    """Video for the FACE PASS mode: upload / pick a file here (button 'choose video to upload'), or plug any
+    Load Video node into 'frames', or leave '(none)' to use the path typed on the panel. Nothing is checked or
+    decoded before the run, and nothing is decoded at all in GENERATE mode."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        d = folder_paths.get_input_directory()
+        files = []
+        for root, _, names in os.walk(d):
+            for n in names:
+                if n.lower().endswith(_VIDEO_EXT):
+                    files.append(os.path.relpath(os.path.join(root, n), d).replace(os.sep, "/"))
+        return {"required": {"video": (["(none)"] + sorted(files), {"video_upload": True,
+                             "tooltip": "Upload or pick the FullHD video to refine. '(none)' = use the panel's path."})},
+                "optional": {"frames": ("IMAGE", {"tooltip": "Optional: frames from any Load Video node."}),
+                             "fallback_path": ("STRING", {"forceInput": True})}}
+
+    RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "STRING")
+    RETURN_NAMES = ("images", "frames", "fps", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, video):
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, video, frames=None, fallback_path=None):
+        p = cls._pick(video, fallback_path)
+        return f"{p}:{os.path.getmtime(p)}" if p else f"{video}|{fallback_path}"
+
+    @staticmethod
+    def _pick(video, fallback_path):
+        import folder_paths
+        if video and video != "(none)":
+            p = os.path.join(folder_paths.get_input_directory(), video)
+            if os.path.isfile(p):
+                return p
+        if fallback_path:
+            return StacyLoadVideo._find(fallback_path)
+        return None
+
+    def run(self, video, frames=None, fallback_path=None):
+        if frames is not None:
+            rep = f"video: {frames.shape[0]} frames {frames.shape[2]}x{frames.shape[1]} from the connected Load Video node"
+            print("[StacyLoop] " + rep)
+            return (frames[..., :3], int(frames.shape[0]), 24.0, rep)
+        p = self._pick(video, fallback_path)
+        if not p:
+            raise FileNotFoundError("StacyVideoInput: no video - upload one in this node or type a path on the panel "
+                                    f"(got '{video}' / '{fallback_path}')")
+        out, fps = _read_video(p)
+        rep = f"video: {os.path.basename(p)}  {out.shape[0]} frames  {out.shape[2]}x{out.shape[1]}  {fps:.2f} fps"
+        print("[StacyLoop] " + rep)
+        return (out, int(out.shape[0]), fps, rep)
+
+
 NODE_CLASS_MAPPINGS = {
     "StacyFitFrame": StacyFitFrame,
     "StacySigmas": StacySigmas,
@@ -959,6 +1042,7 @@ NODE_CLASS_MAPPINGS = {
     "StacyGate": StacyGate,
     "StacyLoadVideo": StacyLoadVideo,
     "StacyColorLock": StacyColorLock,
+    "StacyVideoInput": StacyVideoInput,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyFitFrame": "Stacy · Fit frame (cover crop)",
@@ -978,4 +1062,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyGate": "Stacy · Gate (mode switch)",
     "StacyLoadVideo": "Stacy · Load ready video (by name)",
     "StacyColorLock": "Stacy · Colour lock to keyframe (low VRAM)",
+    "StacyVideoInput": "Stacy · Video for face pass (upload)",
 }
