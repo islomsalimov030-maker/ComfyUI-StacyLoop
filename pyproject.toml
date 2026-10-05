@@ -1,0 +1,5 @@
+[project]
+name = "comfyui-stacyloop"
+version = "1.0.0"
+description = "Loop seam/extend/fold, face flow-lock and hand-aware denoise for MiniMax H3 loops"
+dependencies = ["opencv-python-headless", "ultralytics"]
