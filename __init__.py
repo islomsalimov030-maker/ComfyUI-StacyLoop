@@ -32,11 +32,20 @@ All math is plain torch on whatever device the tensors are on.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 
 CATEGORY = "StacyLoop"
+
+
+class _AnyType(str):
+    def __ne__(self, other):
+        return False
+
+
+_ANY = _AnyType("*")
 
 
 def _grid_up(n: int) -> int:
@@ -616,6 +625,280 @@ class StacyOcclusionDenoise:
         return (out, rep)
 
 
+# ---------------------------------------------------------------- controls panel / report / VRAM
+def _sl(kind, default, lo, hi, step, tip):
+    d = {"default": default, "min": lo, "max": hi, "step": step, "display": "slider", "tooltip": tip}
+    if kind == "FLOAT":
+        d["round"] = step
+    return (kind, d)
+
+
+class StacyControls:
+    """All the knobs of the Stacy H3 loop workflow in one panel (sliders and toggles)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "mode": ("BOOLEAN", {"default": True, "label_on": "GENERATE a new clip",
+                                 "label_off": "FACE PASS of a ready video",
+                                 "tooltip": "On: generate from the keyframe + prompt. Off: only run the face pass on "
+                                            "the video named in 'video' (nothing is generated)."}),
+            "video": ("STRING", {"default": "stacy_h3/Stacy_00001.mp4", "multiline": False,
+                                 "tooltip": "FACE PASS mode only: the FullHD video to refine - a file name in ComfyUI's "
+                                            "output or input folder (e.g. stacy_h3/Stacy_00003.mp4) or a full path."}),
+            "duration_sec": _sl("FLOAT", 8.0, 5.0, 10.0, 0.25,
+                                "Clip length. Snapped to H3's 17k+5 frame grid at 24 fps (7 s = 175, 8 s = 192, "
+                                "9 s = 209, 10 s = 243 frames). The report prints the exact length used."),
+            "seed": ("INT", {"default": 777, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": "fixed",
+                             "tooltip": "Generation seed. The face pass uses seed + 17."}),
+            "loop": ("BOOLEAN", {"default": True, "label_on": "loop (first = last frame)",
+                                 "label_off": "entry clip (no loop)",
+                                 "tooltip": "Off for the pose-entry clips (Standing-4 / Standing-9): no last-frame "
+                                            "anchor, no loop seam; the last frame is saved for the next loop."}),
+            "steps": _sl("INT", 20, 8, 40, 1, "Sampling steps (official H3 scheme: 20, res_multistep)."),
+            "shift": _sl("FLOAT", 12.0, 6.0, 16.0, 0.5,
+                         "Sigma shift. 12 = official. Lower = more motion freedom / less adherence to the "
+                         "keyframe, higher = stiffer."),
+            "color_lock": _sl("FLOAT", 1.0, 0.0, 1.0, 0.05,
+                              "Colour match of every frame to the keyframe (0 = off)."),
+            "seam_crossfade": _sl("INT", 8, 0, 24, 1, "Frames the tail cross-fades into the head (loop only)."),
+            "free_vram": ("BOOLEAN", {"default": True, "label_on": "free VRAM after sampling",
+                                      "label_off": "keep models loaded",
+                                      "tooltip": "On for 24-32 GB GPUs (colour lock / RTX / face pass need the "
+                                                 "memory). Off on a 96 GB GPU = faster batches."}),
+            "face_pass": ("BOOLEAN", {"default": True, "label_on": "face pass ON", "label_off": "face pass OFF",
+                                      "tooltip": "Off = generation + FullHD only (the face pass can be run later "
+                                                 "on the FullHD video)."}),
+            "face_denoise": _sl("FLOAT", 0.30, 0.10, 0.50, 0.01,
+                                "How much the face pass redraws the face. 0.25 softer ... 0.40 stronger identity."),
+            "face_lora": _sl("FLOAT", 1.0, 0.0, 1.5, 0.05, "Stacy face LoRA strength in the face pass."),
+            "large_face_mult": _sl("FLOAT", 0.35, 0.10, 1.0, 0.05,
+                                   "Denoise multiplier for LARGE faces (close-ups need less redraw); small faces "
+                                   "always get the full face_denoise."),
+            "face_lock": _sl("FLOAT", 1.0, 0.0, 1.0, 0.05,
+                             "Pull the redrawn face onto the source geometry (anti-jitter). 0 = off."),
+            "face_lock_temporal": _sl("FLOAT", 0.8, 0.0, 0.95, 0.05,
+                                      "Motion-compensated smoothing of the face-pass detail over time. Higher = "
+                                      "steadier, lower = livelier micro-expressions."),
+            "hand_strength": _sl("FLOAT", 0.2, 0.0, 1.0, 0.05,
+                                 "Face-pass strength under a hand near the face (0 = leave the hand untouched, "
+                                 "1 = same as the rest of the face)."),
+            "stitch_feather": _sl("INT", 24, 4, 64, 2, "Softness of the pasted face edge, px."),
+            "face_confidence": _sl("FLOAT", 0.35, 0.15, 0.60, 0.05,
+                                   "Face detector confidence. Lower it if a small / turned face is missed."),
+            "crop_factor": _sl("FLOAT", 2.5, 1.8, 3.5, 0.1,
+                               "Face crop size as a multiple of the face height (2.5 = face fills ~40%)."),
+        }}
+
+    RETURN_TYPES = ("INT", "FLOAT", "INT", "INT", "BOOLEAN", "INT", "FLOAT", "FLOAT", "INT", "BOOLEAN", "BOOLEAN",
+                    "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "INT", "FLOAT", "FLOAT", "BOOLEAN", "BOOLEAN",
+                    "STRING")
+    RETURN_NAMES = ("length", "seconds", "seed", "face_seed", "loop", "steps", "shift", "color_lock",
+                    "seam_crossfade", "free_vram", "face_pass", "face_denoise", "face_lora", "large_face_mult",
+                    "face_lock", "face_lock_temporal", "hand_strength", "stitch_feather", "face_confidence",
+                    "crop_factor", "generate", "video_mode", "video")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, duration_sec, seed, loop, steps, shift, color_lock, seam_crossfade, free_vram, face_pass,
+            face_denoise, face_lora, large_face_mult, face_lock, face_lock_temporal, hand_strength,
+            stitch_feather, face_confidence, crop_factor, mode=True, video=""):
+        k = max(1, round((float(duration_sec) * 24 - 5) / 17))
+        n = min(max(17 * k + 5, 124), 362)
+        return (n, round((n - 1) / 24.0, 2), int(seed), int(seed) + 17, bool(loop), int(steps), float(shift),
+                float(color_lock), int(seam_crossfade), bool(free_vram), bool(face_pass), float(face_denoise),
+                float(face_lora), float(large_face_mult), float(face_lock), float(face_lock_temporal),
+                float(hand_strength), int(stitch_feather), float(face_confidence), float(crop_factor),
+                bool(mode), not bool(mode), str(video))
+
+
+class StacyFreeVRAM:
+    """Pass-through that unloads the models and empties the CUDA cache before the post-processing."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "enabled": ("BOOLEAN", {"default": True})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, images, enabled):
+        if enabled:
+            import gc
+            import comfy.model_management as mm
+            mm.unload_all_models()
+            gc.collect()
+            mm.soft_empty_cache()
+            print("[StacyLoop] free VRAM: models unloaded before post-processing")
+        return (images,)
+
+
+class StacyReport:
+    """One readable report for the whole run. Face-pass parts are lazy: never computed when the pass is off."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        lz = {"lazy": True, "forceInput": True}
+        return {"required": {"face_pass": ("BOOLEAN", {"forceInput": True}),
+                             "loop": ("BOOLEAN", {"forceInput": True}),
+                             "seconds": ("FLOAT", {"forceInput": True}),
+                             "length": ("INT", {"forceInput": True})},
+                "optional": {"final_frames": ("INT", {"forceInput": True}),
+                             "face_track": ("STRING", lz), "face_inject": ("STRING", lz),
+                             "face_denoise": ("STRING", lz), "hands": ("STRING", lz), "face_lock": ("STRING", lz)}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+    FACE = ("face_track", "face_inject", "face_denoise", "hands", "face_lock")
+
+    def check_lazy_status(self, face_pass, loop, seconds, length, **kw):
+        return [k for k in self.FACE if face_pass and kw.get(k) is None]
+
+    def run(self, face_pass, loop, seconds, length, final_frames=None, **kw):
+        out = ["=== GENERATION ===",
+               f"mode: {'loop (keyframe = first and last frame)' if loop else 'entry clip (no loop)'}",
+               f"length: {length} frames = {seconds:.2f} s @ 24 fps"
+               + (f"; after the loop seam: {final_frames} frames" if final_frames else "")]
+        if not face_pass:
+            out += ["", "=== FACE PASS ===", "off (FullHD output without face refine)"]
+        else:
+            heads = {"face_track": "FACE TRACK", "face_inject": "FACE CROPS -> LATENT",
+                     "face_denoise": "PER-FRAME DENOISE", "hands": "HANDS NEAR THE FACE", "face_lock": "FACE LOCK"}
+            for k in self.FACE:
+                if kw.get(k):
+                    out += ["", f"=== {heads[k]} ===", str(kw[k]).strip()]
+        rep = "\n".join(out)
+        print("[StacyLoop] report\n" + rep)
+        return (rep,)
+
+
+class StacyPromptRetime:
+    """Keep the prompt's clip length in step with the duration slider. The H3 prompts state the clip length
+    ('static shot of 8.0 seconds', 'From 4.80 to 7.96 seconds', 'At 7.96 seconds the shot ends'): the final
+    time is replaced by the new one, the action phases keep their times, the closing rest phase stretches or
+    shrinks. Warns when an action phase would end after the new clip end."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"prompt": ("STRING", {"forceInput": True}),
+                             "seconds": ("FLOAT", {"forceInput": True})},
+                "optional": {"loop": ("BOOLEAN", {"forceInput": True})}}
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("prompt", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, prompt, seconds, loop=True):
+        import re
+        notes = []
+        if not loop:            # entry clip: drop every "ends on the keyframe" instruction of a loop prompt
+            before = prompt
+            prompt = prompt.replace(" and also its last frame", "").replace(" and ends on <Picture 1>", "")
+            prompt = prompt.replace(", then returns to exactly the starting pose so the clip loops seamlessly", "")
+            prompt = re.sub(r" At \d+\.\d+ seconds the shot ends on <Picture 1>:[^.]*\.", "", prompt)
+            if prompt != before:
+                notes.append("loop OFF: the 'ends on the keyframe' lines were removed from the prompt")
+        new_end = f"{float(seconds):.2f}"
+        m = re.search(r"At (\d+\.\d+) seconds the shot ends", prompt)
+        if not m:
+            ends_ = re.findall(r"to (\d+\.\d+) seconds", prompt)
+            if not ends_:
+                return (prompt, "\n".join(notes + ["prompt timing: no time marks found - prompt used as is"]))
+            old_end = max(ends_, key=float)
+        else:
+            old_end = m.group(1)
+        out = prompt.replace(f"{old_end} seconds", f"{new_end} seconds")
+        out = re.sub(r"(static shot of )(\d+(?:\.\d+)?)( seconds)", lambda k: f"{k.group(1)}{float(seconds):.1f}{k.group(3)}", out)
+        ends = [float(b) for a, b in re.findall(r"From (\d+\.\d+) to (\d+\.\d+) seconds", out)]
+        starts = [float(a) for a, b in re.findall(r"From (\d+\.\d+) to (\d+\.\d+) seconds", out)]
+        warn = ""
+        if starts and max(starts) >= float(seconds) - 0.3:
+            warn = (f"\nWARNING: the last phase starts at {max(starts):.2f} s - the clip is too short for this "
+                    f"prompt's actions; make it longer.")
+        rep = f"prompt timing: clip end {old_end} s -> {new_end} s" + ("" if old_end != new_end else " (unchanged)") + warn
+        return (out, "\n".join(notes + [rep]))
+
+
+class StacyGate:
+    """Pass the value through when enabled; otherwise block everything downstream silently (and, being lazy,
+    never compute the branch that feeds it). Used for the GENERATE / FACE PASS-of-a-video mode switch."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"enabled": ("BOOLEAN", {"forceInput": True}),
+                             "value": (_ANY, {"lazy": True})}}
+
+    RETURN_TYPES = (_ANY,)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def check_lazy_status(self, enabled, value=None):
+        return ["value"] if enabled and value is None else []
+
+    def run(self, enabled, value=None):
+        if not enabled:
+            from comfy_execution.graph_utils import ExecutionBlocker
+            return (ExecutionBlocker(None),)
+        return (value,)
+
+
+class StacyLoadVideo:
+    """Load a ready video (for the face pass) by file name: ComfyUI output folder, input folder or full path.
+    Nothing is checked before the run, so the workflow validates even when this branch is switched off."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("STRING", {"forceInput": True})}}
+
+    RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "STRING")
+    RETURN_NAMES = ("images", "frames", "fps", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    @classmethod
+    def IS_CHANGED(cls, video):
+        p = cls._find(video)
+        return f"{p}:{os.path.getmtime(p)}" if p else video
+
+    @staticmethod
+    def _find(video):
+        import folder_paths
+        v = str(video).strip().strip('"')
+        for base in ("", folder_paths.get_output_directory(), folder_paths.get_input_directory()):
+            p = os.path.join(base, v) if base else v
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def run(self, video):
+        import cv2
+        import numpy as np
+        p = self._find(video)
+        if not p:
+            raise FileNotFoundError(f"StacyLoadVideo: '{video}' not found in output/, input/ or as a full path")
+        cap = cv2.VideoCapture(p)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+        frames = []
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            frames.append(torch.from_numpy(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
+        cap.release()
+        if not frames:
+            raise ValueError(f"StacyLoadVideo: no frames decoded from {p}")
+        out = torch.stack(frames).float().div_(255.0)
+        rep = f"video: {os.path.basename(p)}  {out.shape[0]} frames  {out.shape[2]}x{out.shape[1]}  {fps:.2f} fps"
+        print("[StacyLoop] " + rep)
+        return (out, int(out.shape[0]), fps, rep)
+
+
 NODE_CLASS_MAPPINGS = {
     "StacyFitFrame": StacyFitFrame,
     "StacySigmas": StacySigmas,
@@ -627,6 +910,12 @@ NODE_CLASS_MAPPINGS = {
     "StacyHandMask": StacyHandMask,
     "StacyFlowAlign": StacyFlowAlign,
     "StacyOcclusionDenoise": StacyOcclusionDenoise,
+    "StacyControls": StacyControls,
+    "StacyFreeVRAM": StacyFreeVRAM,
+    "StacyReport": StacyReport,
+    "StacyPromptRetime": StacyPromptRetime,
+    "StacyGate": StacyGate,
+    "StacyLoadVideo": StacyLoadVideo,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyFitFrame": "Stacy · Fit frame (cover crop)",
@@ -639,4 +928,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyHandMask": "Stacy · Face paste mask without hands",
     "StacyFlowAlign": "Stacy · Lock refined face to source geometry + motion",
     "StacyOcclusionDenoise": "Stacy · Gentler face pass under hands (soft mask)",
+    "StacyControls": "Stacy · Controls (all knobs)",
+    "StacyFreeVRAM": "Stacy · Free VRAM (pass-through)",
+    "StacyReport": "Stacy · Run report",
+    "StacyPromptRetime": "Stacy · Prompt length = duration",
+    "StacyGate": "Stacy · Gate (mode switch)",
+    "StacyLoadVideo": "Stacy · Load ready video (by name)",
 }
