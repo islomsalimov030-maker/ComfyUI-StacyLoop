@@ -1070,7 +1070,178 @@ class StacySettings:
         return tuple(settings[n] for n in self.RETURN_NAMES)
 
 
+
+# ---------------------------------------------------------------- temporal stabilizer (static-region shimmer)
+def _dev():
+    try:
+        import comfy.model_management as mm
+        return mm.get_torch_device()
+    except Exception:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _gblur(x, s):
+    """x: N,C,H,W separable gaussian, replicate padding."""
+    k = int(s * 3) * 2 + 1
+    t = torch.arange(k, device=x.device, dtype=x.dtype) - k // 2
+    g = torch.exp(-t ** 2 / (2 * s * s)); g = g / g.sum()
+    C = x.shape[1]
+    x = F.conv2d(F.pad(x, (k // 2, k // 2, 0, 0), mode="replicate"), g.view(1, 1, 1, k).repeat(C, 1, 1, 1), groups=C)
+    return F.conv2d(F.pad(x, (0, 0, k // 2, k // 2), mode="replicate"), g.view(1, 1, k, 1).repeat(C, 1, 1, 1), groups=C)
+
+
+def _gray(x):  # T,H,W,3 -> T,1,H,W
+    return (x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114).unsqueeze(1)
+
+
+def _shimmer_stats(frames, dev, n=48, mot=None):
+    """Fine (pixel-level) frame-to-frame change in static areas, coarse change, sharpness. Values in 0-255 levels.
+    Streams frame by frame (a few full-res frames on the GPU at a time)."""
+    T = min(frames.shape[0], n)
+    H, W = frames.shape[1:3]
+    g = lambda i: _gray(frames[i:i + 1].to(dev, torch.float32)) * 255
+    small = lambda x: _gblur(F.avg_pool2d(x, 4), 1.5)
+    if mot is None:
+        acc = None; prev = small(g(0))
+        for i in range(1, T):
+            cur = small(g(i)); d = (cur - prev).abs(); acc = d if acc is None else acc + d; prev = cur
+        mot = F.interpolate(acc / (T - 1), size=(H, W), mode="bilinear", align_corners=False)[0, 0]
+    q = mot.flatten()[::13]
+    st = mot < torch.quantile(q, 0.4); mv = mot > torch.quantile(q, 0.98)
+    lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=dev, dtype=torch.float32).view(1, 1, 3, 3)
+    fine = coarse = ss = sm = 0.0
+    prev = g(0)
+    for i in range(1, T):
+        cur = g(i); d = cur - prev; lo = _gblur(d, 2.0); hi = d - lo
+        fine += float(hi[0, 0][st].pow(2).mean()); coarse += float(lo[0, 0][st].pow(2).mean())
+        L = F.conv2d(F.pad(cur, (1, 1, 1, 1), mode="replicate"), lap)[0, 0]
+        ss += float(L[st].var()); sm += float(L[mv].var()) if mv.any() else 0.0
+        prev = cur
+    k = T - 1
+    return dict(fine=(fine / k) ** 0.5, coarse=(coarse / k) ** 0.5, sharp_static=ss / k, sharp_moving=sm / k,
+                mot=mot, st=st, mv=mv)
+
+
+class StacyTemporalStabilize:
+    """Removes the pixel 'shimmer' of static areas (generator texture boiling, amplified by RTX sharpening) by
+    averaging each pixel with its neighbour frames ONLY where nothing moves (temporal bilateral filter): a neighbour
+    frame whose blurred content differs from the current one gets ~0 weight, so moving parts never ghost."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "strength": _sl("FLOAT", 1.0, 0.0, 1.0, 0.05, "0 = off, 1 = full stabilization of static areas."),
+            "radius": _sl("INT", 2, 1, 4, 1, "Neighbour frames on each side (2 = 5-frame window)."),
+            "threshold": _sl("FLOAT", 3.0, 1.0, 10.0, 0.5,
+                             "Motion sensitivity in 0-255 levels: a local change above this counts as real motion "
+                             "and is left untouched. Lower = safer for slow motion, higher = stronger smoothing."),
+            "loop": ("BOOLEAN", {"default": True, "tooltip": "Loop clip: the window wraps around the seam."}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, images, strength, radius, threshold, loop):
+        T = images.shape[0]
+        if strength <= 0 or T < 3:
+            return (images, "stabilizer: off")
+        dev = _dev(); thr = threshold / 255.0
+        guide = torch.empty((T, 1) + tuple(images.shape[1:3]), dtype=torch.float16)
+        for i in range(0, T, 16):
+            guide[i:i + 16] = _gblur(_gray(images[i:i + 16].to(dev, torch.float32)), 1.5).half().cpu()
+        out = torch.empty_like(images)
+        for t in range(T):
+            idx = [((t + d) % T) if loop else min(max(t + d, 0), T - 1) for d in range(-radius, radius + 1)]
+            nb = images[idx].to(dev, torch.float32)
+            gb = guide[idx].to(dev, torch.float32)
+            w = torch.exp(-((gb - gb[radius:radius + 1]) / thr) ** 2)[:, 0].unsqueeze(-1)
+            w[radius] = 1.0
+            avg = (w * nb).sum(0) / w.sum(0)
+            cur = nb[radius]
+            out[t] = (cur + strength * (avg - cur)).clamp(0, 1).to(out.dtype).cpu()
+        a = _shimmer_stats(images, dev); b = _shimmer_stats(out, dev, mot=a["mot"])
+        mvch = 0.0
+        if a["mv"].any():
+            n = min(T, 48)
+            mvch = sum(float((out[i].to(dev) - images[i].to(dev)).abs().mean(-1)[a["mv"]].mean()) for i in range(n)) / n * 255
+        rep = (f"STABILIZER (strength {strength:.2f}, radius {radius}, threshold {threshold:.1f}, loop {loop})\n"
+               f"shimmer in static areas (fine, 0-255): {a['fine']:.2f} -> {b['fine']:.2f} "
+               f"({100 * (1 - b['fine'] / max(a['fine'], 1e-6)):.0f}% less)\n"
+               f"coarse flicker in static areas: {a['coarse']:.2f} -> {b['coarse']:.2f}\n"
+               f"sharpness static: {a['sharp_static']:.1f} -> {b['sharp_static']:.1f}; "
+               f"moving: {a['sharp_moving']:.1f} -> {b['sharp_moving']:.1f}\n"
+               f"mean change in the most moving areas (ghosting risk): {mvch:.2f} / 255")
+        print("[StacyLoop] " + rep.replace("\n", " | "))
+        return (out, rep)
+
+
+class StacyABCompare:
+    """A/B check video: 2x zoom of the most textured STATIC area (top) and of the most MOVING area (bottom),
+    A on the left, B on the right. Crops are picked automatically from A."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image_a": ("IMAGE",), "image_b": ("IMAGE",),
+                             "label_a": ("STRING", {"default": "A: as is"}),
+                             "label_b": ("STRING", {"default": "B: stabilized"})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    @staticmethod
+    def _label(text, w, h=40):
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+        im = Image.new("RGB", (w, h), (0, 0, 0)); dr = ImageDraw.Draw(im)
+        font = None
+        for f in ("DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "arial.ttf"):
+            try:
+                font = ImageFont.truetype(f, 28); break
+            except Exception:
+                pass
+        dr.text((12, 4), text, fill=(255, 255, 255), font=font or ImageFont.load_default())
+        return torch.from_numpy(np.asarray(im).astype("float32") / 255.0)
+
+    def run(self, image_a, image_b, label_a, label_b):
+        dev = _dev(); T, H, W, _ = image_a.shape
+        cw, ch = W // 4, H // 4
+        s = _shimmer_stats(image_a, dev)
+        g = _gray(image_a[:1].to(dev, torch.float32)) * 255  # texture of the first frame
+        lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=dev, dtype=g.dtype).view(1, 1, 3, 3)
+        tex = F.conv2d(F.pad(g, (1, 1, 1, 1), mode="replicate"), lap).abs()[0, 0]
+        stf = (s["mot"] < torch.quantile(s["mot"].flatten()[::7], 0.6)).float()
+        best, sx, sy = -1.0, 0, 0
+        for y in range(0, H - ch + 1, max(ch // 9, 8)):
+            for x in range(0, W - cw + 1, max(cw // 12, 8)):
+                if stf[y:y + ch, x:x + cw].mean() < 0.8:
+                    continue
+                v = float(tex[y:y + ch, x:x + cw].mean())
+                if v > best:
+                    best, sx, sy = v, x, y
+        mv = s["mot"]; m = mv * (mv > torch.quantile(mv.flatten()[::7], 0.98))
+        ys = torch.arange(H, device=dev).float(); xs = torch.arange(W, device=dev).float()
+        tot = float(m.sum()) or 1.0
+        my = int(float((m.sum(1) * ys).sum()) / tot); mx = int(float((m.sum(0) * xs).sum()) / tot)
+        mx = min(max(mx - cw // 2, 0), W - cw); my = min(max(my - ch // 2, 0), H - ch)
+        la = self._label(label_a, 2 * cw); lb = self._label(label_b, 2 * cw)
+        out = torch.empty((T, 4 * ch, 4 * cw, 3), dtype=torch.float32)
+        z = lambda im, x, y: im[y:y + ch, x:x + cw].repeat_interleave(2, 0).repeat_interleave(2, 1)
+        for t in range(T):
+            a, b = image_a[t], image_b[min(t, image_b.shape[0] - 1)]
+            top = torch.cat([z(a, sx, sy), z(b, sx, sy)], 1); bot = torch.cat([z(a, mx, my), z(b, mx, my)], 1)
+            fr = torch.cat([top, bot], 0)
+            fr[:la.shape[0], :2 * cw] = la; fr[:lb.shape[0], 2 * cw:4 * cw] = lb
+            out[t] = fr
+        return (out,)
+
 NODE_CLASS_MAPPINGS = {
+    "StacyTemporalStabilize": StacyTemporalStabilize,
+    "StacyABCompare": StacyABCompare,
     "StacyFitFrame": StacyFitFrame,
     "StacySigmas": StacySigmas,
     "StacyLoopSeam": StacyLoopSeam,
@@ -1093,6 +1264,8 @@ NODE_CLASS_MAPPINGS = {
     "StacySettings": StacySettings,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "StacyTemporalStabilize": "Stacy · Stabilize static areas (anti-shimmer)",
+    "StacyABCompare": "Stacy · A/B zoom compare",
     "StacyFitFrame": "Stacy · Fit frame (cover crop)",
     "StacySigmas": "Stacy · Low-denoise sigmas (H3)",
     "StacyLoopSeam": "Stacy · Loop seam (tail→head)",
