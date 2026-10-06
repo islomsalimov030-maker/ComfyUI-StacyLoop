@@ -171,7 +171,7 @@ class StacyLoopSeam:
             g = F.avg_pool2d(images[..., :3].mean(-1, keepdim=True).permute(0, 3, 1, 2).float(), 4)[:, 0] * 255
             steps = (g[1:] - g[:-1]).abs().mean((1, 2))
             s = float(steps.median()); m = float((g[-1] - g[0]).abs().mean())
-            r = m / max(s, 1e-3)
+            r = m / max(s, 2.0)   # a jump under ~2 levels is invisible whatever the motion is
             crossfade = 4 if r <= 1.0 else int(min(max(round(4 + 8 * (r - 1.0)), 4), 16))
             rep = (f"seam_crossfade: auto -> {crossfade} frames (seam jump {m:.2f} vs typical frame step {s:.2f}, "
                    f"x{r:.1f})")
@@ -1251,7 +1251,7 @@ class StacySettings:
         if a.get("seam_crossfade"):
             v["seam_crossfade"] = -1; rep.append("seam_crossfade: auto -> measured at the loop seam (see below)")
         if a.get("face_confidence"):
-            v["face_confidence"] = -1.0; rep.append("face_confidence: auto -> measured on the video frames (see below)")
+            v["face_confidence"] = -1.0
         face_auto = a.get("face_denoise") or a.get("stitch_feather") or (branch == "generate" and a.get("face_pass"))
         if face_auto and self._active(settings, branch):
             h, why = _face_height(probe_image) if probe_image is not None else (None, "no probe image")
@@ -1273,6 +1273,8 @@ class StacySettings:
                     rep.append(f"stitch_feather: auto -> {v['stitch_feather']} px")
             elif branch == "generate" and a.get("face_pass"):
                 v["face_pass"] = True; rep.append("face_pass: auto -> ON (face size unknown)")
+        if a.get("face_confidence") and (branch != "generate" or v["face_pass"]):
+            rep.append("face_confidence: auto -> measured on the video frames (see below)")
         text = "AUTO SETTINGS\n" + ("\n".join(rep) if rep else "(all manual)")
         if rep:
             print("[StacyLoop] " + text.replace("\n", " | "))
