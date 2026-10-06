@@ -1057,9 +1057,10 @@ class StacyVideoInput:
 
 _PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "steps", "shift", "color_lock_auto", "color_lock",
                 "seam_crossfade_auto", "seam_crossfade", "free_vram", "face_pass", "face_denoise_auto", "face_denoise",
-                "face_lora", "large_face_mult", "face_lock", "face_lock_temporal", "hand_strength",
-                "stitch_feather_auto", "stitch_feather", "face_confidence", "crop_factor")
-_AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather")
+                "face_lora", "face_lock_temporal", "stitch_feather_auto", "stitch_feather", "face_confidence_auto",
+                "face_confidence")
+_AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence")
+_PANEL_FIXED = {"large_face_mult": 0.35, "hand_strength": 0.2, "face_lock": 1.0, "crop_factor": 2.5}  # tuned, hidden
 _TRI = ["auto", "on", "off"]
 
 
@@ -1084,6 +1085,8 @@ class StacyPanel:
         req["face_denoise_auto"] = _auto_toggle("face_denoise", "smaller face on the keyframe = stronger redraw "
                                                 "(0.35 for tiny faces ... 0.25 for big ones).")
         req["stitch_feather_auto"] = _auto_toggle("stitch_feather", "edge softness proportional to the face size.")
+        req["face_confidence_auto"] = _auto_toggle("face_confidence", "the highest detector threshold that still finds "
+                                                   "the face on >= 90% of the frames (0.35 ... 0.20).")
         req["face_pass"] = (_TRI, {"default": "auto", "tooltip": "auto: ON when the face on the keyframe is smaller "
                                    "than the face-pass canvas (it really gains detail), OFF for close-ups where it "
                                    "adds nothing. on / off: forced."})
@@ -1104,6 +1107,8 @@ class StacyPanel:
             auto[k] = v == "auto"
             kw[k] = v != "off"
         kw.setdefault("video", "")
+        for k, v in _PANEL_FIXED.items():
+            kw.setdefault(k, v)
         vals = StacyControls().run(**kw)
         d = dict(zip(StacyControls.RETURN_NAMES, vals))
         d["_auto"] = auto
@@ -1117,8 +1122,27 @@ def _face_height(img):
     """Height in px (scaled to a 1080-px tall frame) of the largest face on the first frame, or (None, reason).
     Uses the same detector as the face pass (face_yolov8m.pt via ultralytics)."""
     try:
-        import folder_paths
         import numpy as np
+        m, why = _face_model()
+        if m is None:
+            return None, why
+        f = img[0, ..., :3].clamp(0, 1).cpu().numpy()
+        H = f.shape[0]
+        bgr = (f * 255).astype(np.uint8)[..., ::-1].copy()
+        r = m(bgr, conf=0.3, verbose=False)[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return None, "no face found on the image"
+        xy = r.boxes.xyxy.cpu().numpy()
+        i = int(((xy[:, 2] - xy[:, 0]) * (xy[:, 3] - xy[:, 1])).argmax())
+        return float(xy[i, 3] - xy[i, 1]) * 1080.0 / H, ""
+    except Exception as e:  # never break the run because of the auto mode
+        return None, f"face detector failed ({type(e).__name__}: {str(e)[:80]})"
+
+
+def _face_model():
+    """The face pass's own detector (face_yolov8m.pt via ultralytics), cached; (model, '') or (None, reason)."""
+    try:
+        import folder_paths
         if "m" not in _FACE_DET:
             path = None
             for key in ("ultralytics_bbox", "ultralytics"):
@@ -1136,17 +1160,53 @@ def _face_height(img):
                 return None, "face detector face_yolov8m.pt not found"
             from ultralytics import YOLO
             _FACE_DET["m"] = YOLO(path)
-        f = img[0, ..., :3].clamp(0, 1).cpu().numpy()
-        H = f.shape[0]
-        bgr = (f * 255).astype(np.uint8)[..., ::-1].copy()
-        r = _FACE_DET["m"](bgr, conf=0.3, verbose=False)[0]
-        if r.boxes is None or len(r.boxes) == 0:
-            return None, "no face found on the image"
-        xy = r.boxes.xyxy.cpu().numpy()
-        i = int(((xy[:, 2] - xy[:, 0]) * (xy[:, 3] - xy[:, 1])).argmax())
-        return float(xy[i, 3] - xy[i, 1]) * 1080.0 / H, ""
-    except Exception as e:  # never break the run because of the auto mode
+        return _FACE_DET["m"], ""
+    except Exception as e:
         return None, f"face detector failed ({type(e).__name__}: {str(e)[:80]})"
+
+
+class StacyAutoConfidence:
+    """face_confidence resolver in front of the face tracker: a value >= 0 passes through; -1 (AUTO) = run the
+    face detector on ~32 frames and take the highest threshold (0.35, 0.30, 0.25, 0.20) that still finds the face
+    on >= 90 % of them (the lowest one if none does)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "confidence": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0,
+                                                                           "step": 0.05})},
+                "optional": {"prev_report": ("STRING", {"forceInput": True})}}
+
+    RETURN_TYPES = ("FLOAT", "STRING")
+    RETURN_NAMES = ("confidence", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, images, confidence, prev_report=None):
+        conf = float(confidence)
+        rep = f"face_confidence: {conf:.2f}"
+        if conf < 0:
+            import numpy as np
+            m, why = _face_model()
+            T = images.shape[0]
+            if m is None:
+                conf, rep = 0.35, f"face_confidence: auto -> 0.35 ({why})"
+            else:
+                idx = sorted(set(np.linspace(0, T - 1, min(T, 32)).round().astype(int).tolist()))
+                best = []
+                for i in idx:
+                    f = images[i, ..., :3].clamp(0, 1).cpu().numpy()
+                    bgr = (f * 255).astype(np.uint8)[..., ::-1].copy()
+                    r = m(bgr, conf=0.15, verbose=False)[0]
+                    best.append(float(r.boxes.conf.max()) if r.boxes is not None and len(r.boxes) else 0.0)
+                best = np.array(best)
+                cov = {t: float((best >= t).mean()) for t in (0.35, 0.30, 0.25, 0.20)}
+                conf = next((t for t in (0.35, 0.30, 0.25, 0.20) if cov[t] >= 0.9), 0.20)
+                rep = (f"face_confidence: auto -> {conf:.2f} (face found on {100 * cov[conf]:.0f}% of {len(idx)} "
+                       f"sampled frames; at 0.35: {100 * cov[0.35]:.0f}%)")
+        if prev_report:
+            rep = prev_report + "\n" + rep
+        print("[StacyLoop] " + rep.replace("\n", " | "))
+        return (conf, rep)
 
 
 class StacySettings:
@@ -1190,6 +1250,8 @@ class StacySettings:
             v["color_lock"] = -1.0; rep.append("color_lock: auto -> measured on the generated clip (see below)")
         if a.get("seam_crossfade"):
             v["seam_crossfade"] = -1; rep.append("seam_crossfade: auto -> measured at the loop seam (see below)")
+        if a.get("face_confidence"):
+            v["face_confidence"] = -1.0; rep.append("face_confidence: auto -> measured on the video frames (see below)")
         face_auto = a.get("face_denoise") or a.get("stitch_feather") or (branch == "generate" and a.get("face_pass"))
         if face_auto and self._active(settings, branch):
             h, why = _face_height(probe_image) if probe_image is not None else (None, "no probe image")
@@ -1456,6 +1518,7 @@ class StacyABCompare:
         return (out,)
 
 NODE_CLASS_MAPPINGS = {
+    "StacyAutoConfidence": StacyAutoConfidence,
     "StacyTemporalStabilize": StacyTemporalStabilize,
     "StacyABCompare": StacyABCompare,
     "StacyFitFrame": StacyFitFrame,
@@ -1480,6 +1543,7 @@ NODE_CLASS_MAPPINGS = {
     "StacySettings": StacySettings,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "StacyAutoConfidence": "Stacy · Face detector threshold (AUTO)",
     "StacyTemporalStabilize": "Stacy · Stabilize static areas (anti-shimmer)",
     "StacyABCompare": "Stacy · A/B zoom compare",
     "StacyFitFrame": "Stacy · Fit frame (cover crop)",
