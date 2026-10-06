@@ -982,7 +982,8 @@ class StacyVideoInput:
         return {"required": {"video": (["(none)"] + sorted(files), {"video_upload": True,
                              "tooltip": "Upload or pick the FullHD video to refine. '(none)' = use the panel's path."})},
                 "optional": {"frames": ("IMAGE", {"tooltip": "Optional: frames from any Load Video node."}),
-                             "fallback_path": ("STRING", {"forceInput": True})}}
+                             "fallback_path": ("STRING", {"forceInput": True}),
+                             "settings": ("STACY_SETTINGS", {"tooltip": "The panel: its 'video' path is the fallback."})}}
 
     RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "STRING")
     RETURN_NAMES = ("images", "frames", "fps", "report")
@@ -994,7 +995,9 @@ class StacyVideoInput:
         return True
 
     @classmethod
-    def IS_CHANGED(cls, video, frames=None, fallback_path=None):
+    def IS_CHANGED(cls, video, frames=None, fallback_path=None, settings=None):
+        if fallback_path is None and isinstance(settings, dict):
+            fallback_path = settings.get("video")
         p = cls._pick(video, fallback_path)
         return f"{p}:{os.path.getmtime(p)}" if p else f"{video}|{fallback_path}"
 
@@ -1009,7 +1012,9 @@ class StacyVideoInput:
             return StacyLoadVideo._find(fallback_path)
         return None
 
-    def run(self, video, frames=None, fallback_path=None):
+    def run(self, video, frames=None, fallback_path=None, settings=None):
+        if fallback_path is None and isinstance(settings, dict):
+            fallback_path = settings.get("video")
         if frames is not None:
             rep = f"video: {frames.shape[0]} frames {frames.shape[2]}x{frames.shape[1]} from the connected Load Video node"
             print("[StacyLoop] " + rep)
@@ -1022,6 +1027,47 @@ class StacyVideoInput:
         rep = f"video: {os.path.basename(p)}  {out.shape[0]} frames  {out.shape[2]}x{out.shape[1]}  {fps:.2f} fps"
         print("[StacyLoop] " + rep)
         return (out, int(out.shape[0]), fps, rep)
+
+
+_PANEL_ORDER = ("mode", "video", "seed", "duration_sec", "loop", "end_frame", "steps", "shift", "color_lock",
+                "seam_crossfade", "free_vram", "face_pass", "face_denoise", "face_lora", "large_face_mult", "face_lock",
+                "face_lock_temporal", "hand_strength", "stitch_feather", "face_confidence", "crop_factor")
+
+
+class StacyPanel:
+    """THE control panel: every knob of the workflow, one 'settings' wire out. Widgets that do not apply to the
+    current mode are greyed out (web/stacy_panel.js): FACE PASS mode disables the generation knobs and the
+    face_pass switch; GENERATE with face_pass OFF disables the face knobs; end_frame only with loop OFF."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        req = StacyControls.INPUT_TYPES()["required"]
+        return {"required": {k: req[k] for k in _PANEL_ORDER}}
+
+    RETURN_TYPES = ("STACY_SETTINGS",)
+    RETURN_NAMES = ("settings",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, **kw):
+        vals = StacyControls().run(**kw)
+        return (dict(zip(StacyControls.RETURN_NAMES, vals)),)
+
+
+class StacySettings:
+    """Unpack the panel's settings wire into the individual values (lives inside the engine subgraphs)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"settings": ("STACY_SETTINGS",)}}
+
+    RETURN_TYPES = StacyControls.RETURN_TYPES
+    RETURN_NAMES = StacyControls.RETURN_NAMES
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, settings):
+        return tuple(settings[n] for n in self.RETURN_NAMES)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1043,6 +1089,8 @@ NODE_CLASS_MAPPINGS = {
     "StacyLoadVideo": StacyLoadVideo,
     "StacyColorLock": StacyColorLock,
     "StacyVideoInput": StacyVideoInput,
+    "StacyPanel": StacyPanel,
+    "StacySettings": StacySettings,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyFitFrame": "Stacy · Fit frame (cover crop)",
@@ -1063,4 +1111,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyLoadVideo": "Stacy · Load ready video (by name)",
     "StacyColorLock": "Stacy · Colour lock to keyframe (low VRAM)",
     "StacyVideoInput": "Stacy · Video for face pass (upload)",
+    "StacyPanel": "Stacy · PANEL (all knobs)",
+    "StacySettings": "Stacy · Settings (unpack)",
 }
+
+WEB_DIRECTORY = "./web"
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
