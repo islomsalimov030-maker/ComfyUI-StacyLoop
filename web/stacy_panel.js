@@ -4,9 +4,9 @@ import { app } from "../../scripts/app.js";
 // 'loop' stays active in both modes: the face pass of a ready video also needs to know if it is a loop.
 const GEN = ["duration_sec", "end_frame", "steps", "shift", "color_lock_auto", "color_lock", "seam_crossfade_auto",
              "seam_crossfade", "free_vram", "face_pass"];
-const FACE = ["face_denoise_auto", "face_denoise", "face_lora", "large_face_mult", "face_lock", "face_lock_temporal",
-              "hand_strength", "stitch_feather_auto", "stitch_feather", "face_confidence", "crop_factor"];
-const AUTO = ["color_lock", "seam_crossfade", "face_denoise", "stitch_feather"];
+const FACE = ["face_denoise_auto", "face_denoise", "face_lora", "face_lock_temporal", "stitch_feather_auto",
+              "stitch_feather", "face_confidence_auto", "face_confidence"];
+const AUTO = ["color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence"];
 const WATCH = ["mode", "face_pass", "loop", ...AUTO.map((n) => n + "_auto")];
 
 function update(node) {
