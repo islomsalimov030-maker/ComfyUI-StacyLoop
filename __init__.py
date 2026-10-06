@@ -152,22 +152,36 @@ class StacyLoopSeam:
     def INPUT_TYPES(cls):
         return {"required": {
             "images": ("IMAGE",),
-            "crossfade": ("INT", {"default": 8, "min": 0, "max": 96,
+            "crossfade": ("INT", {"default": 8, "min": -1, "max": 96,
                                   "tooltip": "Tail frames that cross-fade into the head. 0 = only drop the "
-                                             "duplicated last frame."}),
+                                             "duplicated last frame. -1 = auto from the measured seam jump."}),
             "curve": (["smootherstep", "cosine", "linear"], {"default": "smootherstep"}),
-        }}
+        },
+            "optional": {"prev_report": ("STRING", {"forceInput": True})}}
 
-    RETURN_TYPES = ("IMAGE", "INT")
-    RETURN_NAMES = ("images", "frames")
+    RETURN_TYPES = ("IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("images", "frames", "report")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, images, crossfade, curve):
+    def run(self, images, crossfade, curve, prev_report=None):
         n = images.shape[0]
+        rep = f"seam_crossfade: {crossfade}"
+        if crossfade < 0 and n >= 4:   # auto: jump last -> first vs the typical frame-to-frame change
+            g = F.avg_pool2d(images[..., :3].mean(-1, keepdim=True).permute(0, 3, 1, 2).float(), 4)[:, 0] * 255
+            steps = (g[1:] - g[:-1]).abs().mean((1, 2))
+            s = float(steps.median()); m = float((g[-1] - g[0]).abs().mean())
+            r = m / max(s, 1e-3)
+            crossfade = 4 if r <= 1.0 else int(min(max(round(4 + 8 * (r - 1.0)), 4), 16))
+            rep = (f"seam_crossfade: auto -> {crossfade} frames (seam jump {m:.2f} vs typical frame step {s:.2f}, "
+                   f"x{r:.1f})")
+        elif crossfade < 0:
+            crossfade = 8
+        if prev_report:
+            rep = prev_report + "\n" + rep
         if crossfade <= 0 or n < 3:
             out = images[:-1] if n > 1 else images   # last frame == first frame of the loop
-            return (out, out.shape[0])
+            return (out, out.shape[0], rep)
         N = min(crossfade, n // 3)
         body = images[: n - N].clone()
         tail = images[n - N:]
@@ -175,7 +189,7 @@ class StacyLoopSeam:
         w = _ease((torch.arange(N, dtype=torch.float32) + 1) / (N + 1), curve).to(images.device)
         w = w.view(N, 1, 1, 1).to(images.dtype)
         body[:N] = tail * (1 - w) + body[:N] * w
-        return (body, body.shape[0])
+        return (body, body.shape[0], rep)
 
 
 # ------------------------------------------------------------------ loop extend / fold (video refine passes)
@@ -913,23 +927,35 @@ class StacyColorLock:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"image_target": ("IMAGE",), "image_ref": ("IMAGE",),
-                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                             "strength": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                                                    "tooltip": "-1 = auto: as strong as the measured colour drift."}),
                              "chunk": ("INT", {"default": 16, "min": 1, "max": 256})}}
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "report")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
     def run(self, image_target, image_ref, strength, chunk):
-        if strength <= 0:
-            return (image_target,)
         import kornia
-        import comfy.model_management as mm
-        dev = mm.get_torch_device()
+        dev = _dev()
         ref = image_ref[:1].to(dev).permute(0, 3, 1, 2).contiguous()
         ref_lab = kornia.color.rgb_to_lab(ref[:, :3]).flatten(2)
         ref_std, ref_mean = torch.std_mean(ref_lab, dim=-1, keepdim=True, unbiased=False)
+        rep = f"color_lock: {strength:.2f}"
+        if strength < 0:   # auto: drift of the mean colour (Lab, delta-E of the means) over the clip
+            drifts = []
+            rm = kornia.color.rgb_to_lab(F.avg_pool2d(ref[:, :3].float(), 4)).flatten(2).mean(-1)
+            for i in range(0, image_target.shape[0], 8):
+                x = image_target[i:i + 1, ..., :3].to(dev).permute(0, 3, 1, 2).float()
+                x = F.avg_pool2d(x, 4)
+                m = kornia.color.rgb_to_lab(x).flatten(2).mean(-1)
+                drifts.append(float((m - rm).norm()))
+            d = sorted(drifts)[len(drifts) // 2] if drifts else 0.0
+            strength = float(min(max((d - 1.0) / 3.0, 0.0), 1.0))
+            rep = f"color_lock: auto -> {strength:.2f} (median colour drift from the keyframe: {d:.1f} dE)"
+        if strength <= 0:
+            return (image_target, rep)
         B, H, W, C = image_target.shape
         out = torch.empty((B, H, W, 3), dtype=torch.float32)
         for i in range(0, B, chunk):
@@ -943,7 +969,7 @@ class StacyColorLock:
             res = (1.0 - strength) * src + strength * rgb
             out[i:i + b] = res.permute(0, 2, 3, 1).clamp_(0, 1).cpu()
             del src, lab, flat, rgb, res
-        return (out,)
+        return (out, rep)
 
 
 _VIDEO_EXT = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".gif")
@@ -967,7 +993,7 @@ def _read_video(path):
 
 class StacyVideoInput:
     """Video for the FACE PASS mode: upload / pick a file here (button 'choose video to upload'), or plug any
-    Load Video node into 'frames', or leave '(none)' to use the path typed on the panel. Nothing is checked or
+    Load Video node into 'frames'. ('fallback_path' / the panel path are only kept for old workflows.) Nothing is checked or
     decoded before the run, and nothing is decoded at all in GENERATE mode."""
 
     @classmethod
@@ -1021,7 +1047,7 @@ class StacyVideoInput:
             return (frames[..., :3], int(frames.shape[0]), 24.0, rep)
         p = self._pick(video, fallback_path)
         if not p:
-            raise FileNotFoundError("StacyVideoInput: no video - upload one in this node or type a path on the panel "
+            raise FileNotFoundError("StacyVideoInput: no video - upload one in this node (button 'choose file to upload') "
                                     f"(got '{video}' / '{fallback_path}')")
         out, fps = _read_video(p)
         rep = f"video: {os.path.basename(p)}  {out.shape[0]} frames  {out.shape[2]}x{out.shape[1]}  {fps:.2f} fps"
@@ -1029,19 +1055,40 @@ class StacyVideoInput:
         return (out, int(out.shape[0]), fps, rep)
 
 
-_PANEL_ORDER = ("mode", "video", "seed", "duration_sec", "loop", "end_frame", "steps", "shift", "color_lock",
-                "seam_crossfade", "free_vram", "face_pass", "face_denoise", "face_lora", "large_face_mult", "face_lock",
-                "face_lock_temporal", "hand_strength", "stitch_feather", "face_confidence", "crop_factor")
+_PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "steps", "shift", "color_lock_auto", "color_lock",
+                "seam_crossfade_auto", "seam_crossfade", "free_vram", "face_pass", "face_denoise_auto", "face_denoise",
+                "face_lora", "large_face_mult", "face_lock", "face_lock_temporal", "hand_strength",
+                "stitch_feather_auto", "stitch_feather", "face_confidence", "crop_factor")
+_AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather")
+_TRI = ["auto", "on", "off"]
+
+
+def _auto_toggle(what, how):
+    return ("BOOLEAN", {"default": True, "label_on": f"{what}: AUTO", "label_off": f"{what}: manual (slider below)",
+                        "tooltip": f"AUTO: {how} Off: the slider below is used."})
 
 
 class StacyPanel:
     """THE control panel: every knob of the workflow, one 'settings' wire out. Widgets that do not apply to the
-    current mode are greyed out (web/stacy_panel.js): FACE PASS mode disables the generation knobs and the
-    face_pass switch; GENERATE with face_pass OFF disables the face knobs; end_frame only with loop OFF."""
+    current mode are greyed out (web/stacy_panel.js). Six knobs have an AUTO mode (default): the value is worked
+    out from the keyframe / the generated frames / the GPU, written to the report, and can always be overridden
+    by switching AUTO off and using the slider."""
 
     @classmethod
     def INPUT_TYPES(cls):
-        req = StacyControls.INPUT_TYPES()["required"]
+        req = dict(StacyControls.INPUT_TYPES()["required"])
+        req["color_lock_auto"] = _auto_toggle("color_lock", "colour lock only as strong as the measured colour drift "
+                                              "of the generated clip from the keyframe.")
+        req["seam_crossfade_auto"] = _auto_toggle("seam_crossfade", "cross-fade length from the measured jump "
+                                                  "between the last and the first frame (loop only).")
+        req["face_denoise_auto"] = _auto_toggle("face_denoise", "smaller face on the keyframe = stronger redraw "
+                                                "(0.35 for tiny faces ... 0.25 for big ones).")
+        req["stitch_feather_auto"] = _auto_toggle("stitch_feather", "edge softness proportional to the face size.")
+        req["face_pass"] = (_TRI, {"default": "auto", "tooltip": "auto: ON when the face on the keyframe is smaller "
+                                   "than the face-pass canvas (it really gains detail), OFF for close-ups where it "
+                                   "adds nothing. on / off: forced."})
+        req["free_vram"] = (_TRI, {"default": "auto", "tooltip": "auto: ON for GPUs up to 48 GB (24-32 GB cards need "
+                                   "the memory for colour / RTX / face pass), OFF on bigger cards (faster)."})
         return {"required": {k: req[k] for k in _PANEL_ORDER}}
 
     RETURN_TYPES = ("STACY_SETTINGS",)
@@ -1050,24 +1097,124 @@ class StacyPanel:
     CATEGORY = CATEGORY
 
     def run(self, **kw):
+        auto = {k: bool(kw.pop(k + "_auto", False)) for k in _AUTO_KNOBS}
+        for k in ("face_pass", "free_vram"):
+            v = kw.get(k, "auto")
+            v = "on" if v is True else "off" if v is False else str(v)
+            auto[k] = v == "auto"
+            kw[k] = v != "off"
+        kw.setdefault("video", "")
         vals = StacyControls().run(**kw)
-        return (dict(zip(StacyControls.RETURN_NAMES, vals)),)
+        d = dict(zip(StacyControls.RETURN_NAMES, vals))
+        d["_auto"] = auto
+        return (d,)
+
+
+_FACE_DET = {}
+
+
+def _face_height(img):
+    """Height in px (scaled to a 1080-px tall frame) of the largest face on the first frame, or (None, reason).
+    Uses the same detector as the face pass (face_yolov8m.pt via ultralytics)."""
+    try:
+        import folder_paths
+        import numpy as np
+        if "m" not in _FACE_DET:
+            path = None
+            for key in ("ultralytics_bbox", "ultralytics"):
+                try:
+                    path = folder_paths.get_full_path(key, "face_yolov8m.pt")
+                except Exception:
+                    path = None
+                if path:
+                    break
+            if path is None:
+                for root, _, names in os.walk(folder_paths.models_dir):
+                    if "face_yolov8m.pt" in names:
+                        path = os.path.join(root, "face_yolov8m.pt"); break
+            if path is None:
+                return None, "face detector face_yolov8m.pt not found"
+            from ultralytics import YOLO
+            _FACE_DET["m"] = YOLO(path)
+        f = img[0, ..., :3].clamp(0, 1).cpu().numpy()
+        H = f.shape[0]
+        bgr = (f * 255).astype(np.uint8)[..., ::-1].copy()
+        r = _FACE_DET["m"](bgr, conf=0.3, verbose=False)[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return None, "no face found on the image"
+        xy = r.boxes.xyxy.cpu().numpy()
+        i = int(((xy[:, 2] - xy[:, 0]) * (xy[:, 3] - xy[:, 1])).argmax())
+        return float(xy[i, 3] - xy[i, 1]) * 1080.0 / H, ""
+    except Exception as e:  # never break the run because of the auto mode
+        return None, f"face detector failed ({type(e).__name__}: {str(e)[:80]})"
 
 
 class StacySettings:
-    """Unpack the panel's settings wire into the individual values (lives inside the engine subgraphs)."""
+    """Unpack the panel's settings wire into the individual values (lives inside the engine subgraphs) and
+    resolve the AUTO knobs: face-based ones from 'probe_image' (keyframe / first video frame, only looked at
+    when this engine's mode is active), free_vram from the GPU; colour lock / seam cross-fade are passed on as
+    -1 = measure on the generated frames."""
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"settings": ("STACY_SETTINGS",)}}
+        return {"required": {"settings": ("STACY_SETTINGS",),
+                             "branch": (["generate", "face pass video"], {"default": "generate"})},
+                "optional": {"probe_image": ("IMAGE", {"lazy": True})}}
 
-    RETURN_TYPES = StacyControls.RETURN_TYPES
-    RETURN_NAMES = StacyControls.RETURN_NAMES
+    RETURN_TYPES = StacyControls.RETURN_TYPES + ("STRING",)
+    RETURN_NAMES = StacyControls.RETURN_NAMES + ("auto_report",)
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, settings):
-        return tuple(settings[n] for n in self.RETURN_NAMES)
+    @staticmethod
+    def _active(settings, branch):
+        return bool(settings.get("generate" if branch == "generate" else "video_mode"))
+
+    def check_lazy_status(self, settings, branch="generate", probe_image=None):
+        a = settings.get("_auto", {}) if isinstance(settings, dict) else {}
+        face_auto = a.get("face_denoise") or a.get("stitch_feather") or (branch == "generate" and a.get("face_pass"))
+        if probe_image is None and face_auto and self._active(settings, branch):
+            return ["probe_image"]
+        return []
+
+    def run(self, settings, branch="generate", probe_image=None):
+        v = dict(settings); a = settings.get("_auto", {}); rep = []
+        if a.get("free_vram"):
+            try:
+                gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30 if torch.cuda.is_available() else 0
+            except Exception:
+                gb = 0
+            v["free_vram"] = gb <= 48
+            rep.append(f"free_vram: auto -> {'ON' if v['free_vram'] else 'OFF'} (GPU {gb:.0f} GB)")
+        if a.get("color_lock"):
+            v["color_lock"] = -1.0; rep.append("color_lock: auto -> measured on the generated clip (see below)")
+        if a.get("seam_crossfade"):
+            v["seam_crossfade"] = -1; rep.append("seam_crossfade: auto -> measured at the loop seam (see below)")
+        face_auto = a.get("face_denoise") or a.get("stitch_feather") or (branch == "generate" and a.get("face_pass"))
+        if face_auto and self._active(settings, branch):
+            h, why = _face_height(probe_image) if probe_image is not None else (None, "no probe image")
+            canvas_face = 768.0 / max(float(v["crop_factor"]), 1e-3)   # face height that fills the 768 canvas
+            src = "keyframe" if branch == "generate" else "first video frame"
+            rep.append(f"face on the {src}: " + (f"{h:.0f} px tall (FullHD scale); face-pass canvas fits a "
+                                                f"{canvas_face:.0f} px face" if h else f"? ({why}) - manual values kept"))
+            if h:
+                if branch == "generate" and a.get("face_pass"):
+                    v["face_pass"] = h < canvas_face
+                    rep.append(f"face_pass: auto -> {'ON' if v['face_pass'] else 'OFF'} "
+                               f"({'small face, the pass adds detail' if v['face_pass'] else 'close-up, already sharper than the pass canvas'})")
+                if a.get("face_denoise"):
+                    t = min(max((h - 100.0) / 200.0, 0.0), 1.0)
+                    v["face_denoise"] = round(0.35 - 0.10 * t, 3)
+                    rep.append(f"face_denoise: auto -> {v['face_denoise']:.2f}")
+                if a.get("stitch_feather"):
+                    v["stitch_feather"] = int(min(max(round(h * 0.16 / 2) * 2, 12), 48))
+                    rep.append(f"stitch_feather: auto -> {v['stitch_feather']} px")
+            elif branch == "generate" and a.get("face_pass"):
+                v["face_pass"] = True; rep.append("face_pass: auto -> ON (face size unknown)")
+        text = "AUTO SETTINGS\n" + ("\n".join(rep) if rep else "(all manual)")
+        if rep:
+            print("[StacyLoop] " + text.replace("\n", " | "))
+        return tuple(v[n] for n in StacyControls.RETURN_NAMES) + (text,)
 
 
 
