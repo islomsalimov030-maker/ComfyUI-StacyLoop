@@ -349,15 +349,22 @@ class StacyFlowAlign:
             "temporal": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 0.95, "step": 0.05,
                                    "tooltip": "Motion-compensated consolidation of the refine residual over time."}),
             "flow_size": ("INT", {"default": 384, "min": 128, "max": 1024, "step": 32}),
-        }}
+        },
+            "optional": {"temporal_mode": (["ema", "median"], {"default": "ema", "tooltip":
+                "ema: recursive forward+backward smoothing (long memory - can drag an expression change a few "
+                "frames early/late). median: motion-compensated median of the residual over +-4 frames whose SOURCE "
+                "matches - removes transient flicker / jitter of the refine without moving expressions in time."}),
+                         "radius": ("INT", {"default": 4, "min": 1, "max": 8,
+                                            "tooltip": "median mode: neighbour frames on each side."})}}
 
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("images", "report")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, original, refined, align, align_blur, temporal, flow_size):
+    def run(self, original, refined, align, align_blur, temporal, flow_size, temporal_mode="ema", radius=4):
         import numpy as np
+        import warnings
         import cv2
         n = min(original.shape[0], refined.shape[0])
         H, W = int(refined.shape[1]), int(refined.shape[2])
@@ -392,6 +399,29 @@ class StacyFlowAlign:
                                  borderMode=cv2.BORDER_REFLECT)
         res = R
         res -= O                                                      # residual the refine added
+        # 2b) median mode: per pixel, median of the motion-compensated residuals of the neighbour frames whose
+        #     warped SOURCE matches this frame (an eye that closes / a mouth that opens is excluded, so expression
+        #     timing always follows the source); the refine's own frame-to-frame wobble is voted out.
+        if temporal > 0 and n > 2 and temporal_mode == "median":
+            outm = np.empty_like(res)
+            for i in range(n):
+                stack = [res[i]]; valid = [np.ones((H, W), bool)]
+                for d in range(-int(radius), int(radius) + 1):
+                    j = i + d
+                    if d == 0 or j < 0 or j >= n:
+                        continue
+                    f = up(dis.calc(go[i], go[j], None))
+                    wr = cv2.remap(res[j], xx + f[..., 0], yy + f[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                    wo = cv2.remap(O[j], xx + f[..., 0], yy + f[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                    err = cv2.GaussianBlur(np.abs(wo - O[i]).mean(-1), (0, 0), 1.5)
+                    stack.append(wr); valid.append(err < 0.04)
+                st_ = np.stack(stack); va = np.stack(valid)[..., None]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    med = np.nanmedian(np.where(va, st_, np.nan), 0)
+                outm[i] = res[i] + float(temporal) * (med - res[i])
+            res = outm
+            temporal = 0.0
         # 2) motion-compensated temporal consolidation of the residual (forward + backward, averaged)
         if temporal > 0 and n > 2:
             flows = {}
@@ -422,7 +452,7 @@ class StacyFlowAlign:
         res += O
         out = np.clip(res, 0.0, 1.0, out=res)
         rep = (f"flow align: mean geometric correction {np.mean(shift) if shift else 0:.2f}px "
-               f"(canvas {W}x{H}), temporal {temporal}")
+               f"(canvas {W}x{H}), temporal {temporal_mode}")
         print("[StacyLoop] " + rep)
         t = torch.from_numpy(out).to(refined.device, refined.dtype)
         if refined.shape[-1] == 4:
