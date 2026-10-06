@@ -1055,12 +1055,12 @@ class StacyVideoInput:
         return (out, int(out.shape[0]), fps, rep)
 
 
-_PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "steps", "shift", "color_lock_auto", "color_lock",
-                "seam_crossfade_auto", "seam_crossfade", "free_vram", "face_pass", "face_denoise_auto", "face_denoise",
-                "face_lora", "face_lock_temporal", "stitch_feather_auto", "stitch_feather", "face_confidence_auto",
-                "face_confidence")
+_PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "free_vram", "face_pass", "face_denoise_auto",
+                "face_denoise", "face_lora", "face_lock_temporal")
 _AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence")
-_PANEL_FIXED = {"large_face_mult": 0.35, "hand_strength": 0.2, "face_lock": 1.0, "crop_factor": 2.5}  # tuned, hidden
+# tuned / always-AUTO knobs that are not on the panel any more (official H3 steps/shift; AUTO ones: value unused)
+_PANEL_FIXED = {"steps": 20, "shift": 12.0, "large_face_mult": 0.35, "hand_strength": 0.2, "face_lock": 1.0,
+                "crop_factor": 2.5, "color_lock": 1.0, "seam_crossfade": 8, "stitch_feather": 24, "face_confidence": 0.35}
 _TRI = ["auto", "on", "off"]
 
 
@@ -1100,7 +1100,7 @@ class StacyPanel:
     CATEGORY = CATEGORY
 
     def run(self, **kw):
-        auto = {k: bool(kw.pop(k + "_auto", False)) for k in _AUTO_KNOBS}
+        auto = {k: bool(kw.pop(k + "_auto", True)) for k in _AUTO_KNOBS}   # knobs not on the panel = always AUTO
         for k in ("face_pass", "free_vram"):
             v = kw.get(k, "auto")
             v = "on" if v is True else "off" if v is False else str(v)
@@ -1517,7 +1517,31 @@ class StacyABCompare:
             out[t] = fr
         return (out,)
 
+
+class StacyModelByMode:
+    """Hands ONE model to a single preview node (e.g. KJNodes Model Preview Override) whatever the mode:
+    GENERATE -> the generation model, FACE PASS of a ready video -> the face-pass model. Only the model of the
+    active mode is loaded (lazy inputs)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"settings": ("STACY_SETTINGS",),
+                             "generate_model": ("MODEL", {"lazy": True}),
+                             "face_pass_video_model": ("MODEL", {"lazy": True})}}
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def check_lazy_status(self, settings, generate_model=None, face_pass_video_model=None):
+        return ["generate_model"] if settings.get("generate", True) else ["face_pass_video_model"]
+
+    def run(self, settings, generate_model=None, face_pass_video_model=None):
+        return (generate_model if settings.get("generate", True) else face_pass_video_model,)
+
 NODE_CLASS_MAPPINGS = {
+    "StacyModelByMode": StacyModelByMode,
     "StacyAutoConfidence": StacyAutoConfidence,
     "StacyTemporalStabilize": StacyTemporalStabilize,
     "StacyABCompare": StacyABCompare,
@@ -1543,6 +1567,7 @@ NODE_CLASS_MAPPINGS = {
     "StacySettings": StacySettings,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "StacyModelByMode": "Stacy · Model of the active mode (for preview)",
     "StacyAutoConfidence": "Stacy · Face detector threshold (AUTO)",
     "StacyTemporalStabilize": "Stacy · Stabilize static areas (anti-shimmer)",
     "StacyABCompare": "Stacy · A/B zoom compare",
