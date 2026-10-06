@@ -1122,21 +1122,76 @@ def _shimmer_stats(frames, dev, n=48, mot=None):
                 mot=mot, st=st, mv=mv)
 
 
+def _flow_tools(images, max_w=960):
+    """Grey uint8 frames at flow resolution + DIS optical flow + a GPU warper (bicubic)."""
+    import cv2
+    import numpy as np
+    T, H, W = images.shape[:3]
+    sc = min(1.0, max_w / W)
+    fw, fh = int(round(W * sc)), int(round(H * sc))
+    grey = []
+    for i in range(T):
+        g = (_gray(images[i:i + 1])[0, 0].clamp(0, 1) * 255).to(torch.uint8).numpy()
+        grey.append(cv2.resize(g, (fw, fh), interpolation=cv2.INTER_AREA) if sc < 1 else g)
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+
+    def flow(t, s):  # cur(x) ~ nb(x + f(x)), in full-res pixels, (H, W, 2) float32 tensor
+        f = dis.calc(grey[t], grey[s], None)
+        if sc < 1:
+            f = cv2.resize(f, (W, H), interpolation=cv2.INTER_LINEAR) / sc
+        return torch.from_numpy(np.ascontiguousarray(f))
+
+    return flow
+
+
+def _warp(img, f, dev):
+    """img: N,H,W,C on dev; f: N,H,W,2 flow on dev -> warped img and validity mask (N,H,W,1)."""
+    N, H, W, _ = img.shape
+    ys, xs = torch.meshgrid(torch.arange(H, device=dev, dtype=torch.float32),
+                            torch.arange(W, device=dev, dtype=torch.float32), indexing="ij")
+    x = xs + f[..., 0]; y = ys + f[..., 1]
+    valid = ((x >= 0) & (x <= W - 1) & (y >= 0) & (y <= H - 1)).float().unsqueeze(-1)
+    grid = torch.stack([x / (W - 1) * 2 - 1, y / (H - 1) * 2 - 1], -1)
+    out = F.grid_sample(img.permute(0, 3, 1, 2), grid, mode="bicubic", padding_mode="border", align_corners=True)
+    return out.permute(0, 2, 3, 1).clamp(0, 1), valid
+
+
+def _moving_shimmer(frames, dev, mv, flow, n=48):
+    """Fine frame-to-frame change in MOVING areas after motion compensation (what is left is shimmer, not motion)."""
+    T = min(frames.shape[0], n); acc = 0.0; k = 0
+    for i in range(T - 1):
+        cur = frames[i:i + 1].to(dev, torch.float32); nb = frames[i + 1:i + 2].to(dev, torch.float32)
+        w, valid = _warp(nb, flow(i, i + 1).unsqueeze(0).to(dev), dev)
+        d = (_gray(w) - _gray(cur)) * 255
+        lo = _gblur(d, 2.0); hi = d - lo
+        m = mv & (lo[0, 0].abs() < 6) & (valid[0, ..., 0] > 0)   # skip occlusions / flow failures
+        if m.any():
+            acc += float(hi[0, 0][m].pow(2).mean()); k += 1
+    return (acc / max(k, 1)) ** 0.5
+
+
 class StacyTemporalStabilize:
-    """Removes the pixel 'shimmer' of static areas (generator texture boiling, amplified by RTX sharpening) by
-    averaging each pixel with its neighbour frames ONLY where nothing moves (temporal bilateral filter): a neighbour
-    frame whose blurred content differs from the current one gets ~0 weight, so moving parts never ghost."""
+    """Removes the pixel 'shimmer' of the generated video (texture boiling, amplified by RTX sharpening).
+    Each frame is averaged with its neighbour frames after aligning them onto it with optical flow
+    (motion compensation), so static AND moving areas (clothing, skin, hair) are stabilized; a neighbour pixel
+    that does not match after alignment (occlusion, fast motion, flow error) gets ~0 weight, so nothing ghosts.
+    Best placed BEFORE the RTX upscale (on the raw 1344x768): RTX then sharpens an already stable picture."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
             "images": ("IMAGE",),
-            "strength": _sl("FLOAT", 1.0, 0.0, 1.0, 0.05, "0 = off, 1 = full stabilization of static areas."),
+            "strength": _sl("FLOAT", 1.0, 0.0, 1.0, 0.05, "0 = off, 1 = full stabilization."),
             "radius": _sl("INT", 2, 1, 4, 1, "Neighbour frames on each side (2 = 5-frame window)."),
-            "threshold": _sl("FLOAT", 3.0, 1.0, 10.0, 0.5,
-                             "Motion sensitivity in 0-255 levels: a local change above this counts as real motion "
-                             "and is left untouched. Lower = safer for slow motion, higher = stronger smoothing."),
+            "threshold": _sl("FLOAT", 4.0, 1.0, 12.0, 0.5,
+                             "Match tolerance in 0-255 levels after alignment: a neighbour pixel that differs more "
+                             "is treated as a mismatch and ignored. Lower = safer, higher = stronger smoothing."),
             "loop": ("BOOLEAN", {"default": True, "tooltip": "Loop clip: the window wraps around the seam."}),
+            "motion_compensation": ("BOOLEAN", {"default": True, "tooltip": "Align neighbour frames with optical "
+                                                "flow first (stabilizes moving areas too). Off = static areas only."}),
+            "keep_sharpness": ("BOOLEAN", {"default": True, "tooltip": "Give back the micro-contrast the averaging "
+                                           "takes away (auto-matched to the input). The picture is already stable, "
+                                           "so this does not bring the shimmer back."}),
         }}
 
     RETURN_TYPES = ("IMAGE", "STRING")
@@ -1144,36 +1199,50 @@ class StacyTemporalStabilize:
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, images, strength, radius, threshold, loop):
-        T = images.shape[0]
+    def run(self, images, strength, radius, threshold, loop, motion_compensation=True, keep_sharpness=True):
+        T, H, W = images.shape[:3]
         if strength <= 0 or T < 3:
             return (images, "stabilizer: off")
         dev = _dev(); thr = threshold / 255.0
-        guide = torch.empty((T, 1) + tuple(images.shape[1:3]), dtype=torch.float16)
-        for i in range(0, T, 16):
-            guide[i:i + 16] = _gblur(_gray(images[i:i + 16].to(dev, torch.float32)), 1.5).half().cpu()
+        flow = _flow_tools(images)
         out = torch.empty_like(images)
         for t in range(T):
             idx = [((t + d) % T) if loop else min(max(t + d, 0), T - 1) for d in range(-radius, radius + 1)]
-            nb = images[idx].to(dev, torch.float32)
-            gb = guide[idx].to(dev, torch.float32)
-            w = torch.exp(-((gb - gb[radius:radius + 1]) / thr) ** 2)[:, 0].unsqueeze(-1)
-            w[radius] = 1.0
-            avg = (w * nb).sum(0) / w.sum(0)
-            cur = nb[radius]
-            out[t] = (cur + strength * (avg - cur)).clamp(0, 1).to(out.dtype).cpu()
+            cur = images[t:t + 1].to(dev, torch.float32)
+            others = [s for s in idx if s != t]
+            nb = images[others].to(dev, torch.float32)
+            if motion_compensation and others:
+                fl = torch.stack([flow(t, s) for s in others]).to(dev)
+                nb, valid = _warp(nb, fl, dev)
+            else:
+                valid = torch.ones(nb.shape[:3] + (1,), device=dev)
+            gc = _gblur(_gray(cur), 1.0); gn = _gblur(_gray(nb), 1.0)
+            w = torch.exp(-((gn - gc) / thr) ** 2)[:, 0].unsqueeze(-1) * valid
+            avg = (cur[0] + (w * nb).sum(0)) / (1.0 + w.sum(0))
+            out[t] = (cur[0] + strength * (avg - cur[0])).clamp(0, 1).to(out.dtype).cpu()
+        amount = 0.0
+        if keep_sharpness:
+            def hv(x):  # energy of the fine detail band (what averaging removes)
+                g = _gray(x.to(dev, torch.float32))
+                return float((g - _gblur(g, 1.0)).pow(2).mean())
+            smp = list(range(0, T, max(1, T // 12)))
+            ratio = sum(hv(images[i:i + 1]) for i in smp) / max(sum(hv(out[i:i + 1]) for i in smp), 1e-12)
+            amount = min(max(ratio ** 0.5 - 1.0, 0.0), 0.6)
+            if amount > 0.005:
+                for i in range(T):
+                    x = out[i:i + 1].to(dev, torch.float32)
+                    bl = _gblur(x.permute(0, 3, 1, 2), 1.0).permute(0, 2, 3, 1)
+                    out[i] = (x + amount * (x - bl)).clamp(0, 1)[0].to(out.dtype).cpu()
         a = _shimmer_stats(images, dev); b = _shimmer_stats(out, dev, mot=a["mot"])
-        mvch = 0.0
-        if a["mv"].any():
-            n = min(T, 48)
-            mvch = sum(float((out[i].to(dev) - images[i].to(dev)).abs().mean(-1)[a["mv"]].mean()) for i in range(n)) / n * 255
-        rep = (f"STABILIZER (strength {strength:.2f}, radius {radius}, threshold {threshold:.1f}, loop {loop})\n"
-               f"shimmer in static areas (fine, 0-255): {a['fine']:.2f} -> {b['fine']:.2f} "
-               f"({100 * (1 - b['fine'] / max(a['fine'], 1e-6)):.0f}% less)\n"
-               f"coarse flicker in static areas: {a['coarse']:.2f} -> {b['coarse']:.2f}\n"
+        mvq = a["mot"] > torch.quantile(a["mot"].flatten()[::13], 0.8)
+        ma = _moving_shimmer(images, dev, mvq, flow); mb = _moving_shimmer(out, dev, mvq, _flow_tools(out))
+        pct = lambda x, y: 100 * (1 - y / max(x, 1e-6))
+        rep = (f"STABILIZER (strength {strength:.2f}, radius {radius}, threshold {threshold:.1f}, loop {loop}, "
+               f"motion compensation {motion_compensation}, sharpness restore {amount:.2f}, {W}x{H})\n"
+               f"shimmer in static areas (fine, 0-255): {a['fine']:.2f} -> {b['fine']:.2f} ({pct(a['fine'], b['fine']):.0f}% less)\n"
+               f"shimmer in moving areas (after motion compensation): {ma:.2f} -> {mb:.2f} ({pct(ma, mb):.0f}% less)\n"
                f"sharpness static: {a['sharp_static']:.1f} -> {b['sharp_static']:.1f}; "
-               f"moving: {a['sharp_moving']:.1f} -> {b['sharp_moving']:.1f}\n"
-               f"mean change in the most moving areas (ghosting risk): {mvch:.2f} / 255")
+               f"moving: {a['sharp_moving']:.1f} -> {b['sharp_moving']:.1f}")
         print("[StacyLoop] " + rep.replace("\n", " | "))
         return (out, rep)
 
