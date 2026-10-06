@@ -2,11 +2,9 @@ import { app } from "../../scripts/app.js";
 
 // Stacy PANEL: grey out the knobs that do not apply to the current mode / are set to AUTO.
 // 'loop' stays active in both modes: the face pass of a ready video also needs to know if it is a loop.
-const GEN = ["duration_sec", "end_frame", "steps", "shift", "color_lock_auto", "color_lock", "seam_crossfade_auto",
-             "seam_crossfade", "free_vram", "face_pass"];
-const FACE = ["face_denoise_auto", "face_denoise", "face_lora", "face_lock_temporal", "stitch_feather_auto",
-              "stitch_feather", "face_confidence_auto", "face_confidence"];
-const AUTO = ["color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence"];
+const GEN = ["duration_sec", "end_frame", "free_vram", "face_pass"];
+const FACE = ["face_denoise_auto", "face_denoise", "face_lora", "face_lock_temporal"];
+const AUTO = ["face_denoise"];
 const WATCH = ["mode", "face_pass", "loop", ...AUTO.map((n) => n + "_auto")];
 
 function update(node) {
@@ -18,7 +16,6 @@ function update(node) {
     for (const n of GEN) dis[n] = !generate;
     for (const n of FACE) dis[n] = generate && !facePass;
     if (!generate || loop) dis["end_frame"] = true;
-    if (!generate || !loop) { dis["seam_crossfade"] = true; dis["seam_crossfade_auto"] = true; }
     for (const n of AUTO) if (val(n + "_auto") === true) dis[n] = true;
     for (const [n, d] of Object.entries(dis)) { const w = W(n); if (w) w.disabled = d; }
     node.setDirtyCanvas?.(true, true);
