@@ -603,14 +603,55 @@ class StacyOcclusionDenoise:
                                  "tooltip": "Soft falloff around the hand box, fraction of the box size."}),
             "time_sigma": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 12.0, "step": 0.5,
                                      "tooltip": "Temporal softness in frames: no pop when a hand appears."}),
-        }}
+        },
+            "optional": {
+                "expr_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip":
+                    "Face-pass strength left where the SOURCE face changes expression (eyelids, gaze, mouth), "
+                    "in a window around the change. At high denoise the face model anticipates expression changes "
+                    "a few frames early (eyes close before the source does = 'transparent' eyes); a weaker redraw "
+                    "there keeps the source timing. 1 = off."}),
+                "expr_frames": ("INT", {"default": 6, "min": 0, "max": 16,
+                                        "tooltip": "Frames before/after an expression change that are protected."}),
+            }}
 
     RETURN_TYPES = ("LATENT", "STRING")
     RETURN_NAMES = ("av_latent", "report")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, av_latent, crops, hand_model, confidence, hand_strength, spread, time_sigma):
+    @staticmethod
+    def _expression_map(crops, frames, S=192):
+        """[n,S,S] 0..1: where the source face changes non-rigidly (eyes, mouth) after removing head motion,
+        dilated over +-frames in time."""
+        import numpy as np
+        import cv2
+        n = int(crops.shape[0])
+        g = []
+        for i in range(n):
+            a = (crops[i, ..., :3].float().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+            g.append(cv2.resize(cv2.cvtColor(a, cv2.COLOR_RGB2GRAY), (S, S), interpolation=cv2.INTER_AREA))
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        yy, xx = np.mgrid[0:S, 0:S].astype(np.float32)
+        E = np.zeros((n, S, S), np.float32)
+        for i in range(n):
+            for j in (i - 2, i + 2):
+                if 0 <= j < n:
+                    f = cv2.GaussianBlur(dis.calc(g[i], g[j], None), (0, 0), S * 0.03)   # head motion only
+                    w = cv2.remap(g[j].astype(np.float32), xx + f[..., 0], yy + f[..., 1], cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE)
+                    E[i] = np.maximum(E[i], cv2.GaussianBlur(np.abs(w - g[i].astype(np.float32)), (0, 0), 2.0))
+        P = np.clip((E - 8.0) / 17.0, 0.0, 1.0)
+        P = np.stack([cv2.GaussianBlur(p, (0, 0), 4.0) for p in P])
+        P = np.clip(P / 0.6, 0, 1)
+        if frames > 0 and n > 1:
+            k = np.exp(-0.5 * (np.arange(-frames, frames + 1) / max(frames / 2.0, 0.5)) ** 2)
+            pad = len(k) // 2
+            Pp = np.pad(P, ((pad, pad), (0, 0), (0, 0)), mode="edge")
+            P = np.stack([np.max(Pp[t:t + len(k)] * k[:, None, None], axis=0) for t in range(n)])
+        return P
+
+    def run(self, av_latent, crops, hand_model, confidence, hand_strength, spread, time_sigma,
+            expr_strength=1.0, expr_frames=6):
         import numpy as np
         import cv2
         try:
@@ -627,10 +668,11 @@ class StacyOcclusionDenoise:
         except Exception as e:
             boxes = None
             print("[StacyLoop] occlusion denoise: hand detector failed:", str(e)[:200])
-        if boxes is None:
+        if boxes is None and expr_strength >= 1.0:
             rep = f"occlusion denoise: hand detector '{hand_model}' unavailable - unchanged"
             print("[StacyLoop] " + rep)
             return (av_latent, rep)
+        boxes = boxes or [[] for _ in range(int(crops.shape[0]))]
         n = int(crops.shape[0])
         ch, cw = int(crops.shape[1]), int(crops.shape[2])
         S = 96                                               # work grid, then resampled to the latent grid
@@ -653,6 +695,13 @@ class StacyOcclusionDenoise:
             P = np.pad(occ, ((pad, pad), (0, 0), (0, 0)), mode="edge")
             occ = np.stack([np.max(P[t:t + len(k)] * k[:, None, None], axis=0) for t in range(n)])
         strength = 1.0 - (1.0 - float(hand_strength)) * np.clip(occ, 0, 1)      # [n,S,S]
+        expr_note = ""
+        if expr_strength < 1.0:
+            P = self._expression_map(crops, int(expr_frames))
+            P = np.stack([cv2.resize(p, (S, S), interpolation=cv2.INTER_AREA) for p in P])
+            strength = np.minimum(strength, 1.0 - (1.0 - float(expr_strength)) * P)
+            expr_note = (f"; expression protect x{expr_strength} (+-{expr_frames} fr) on "
+                         f"{int((P.max(axis=(1, 2)) > 0.3).sum())}/{n} frames")
         pm = list(prev.unbind())
         v = pm[0]                                                                # [B,C,T,H,W]
         T, H, W = int(v.shape[-3]), int(v.shape[-2]), int(v.shape[-1])
@@ -664,7 +713,7 @@ class StacyOcclusionDenoise:
         out["noise_mask"] = _nt.NestedTensor(tuple(pm))
         hit = int((occ.max(axis=(1, 2)) > 0.05).sum())
         rep = (f"occlusion denoise: {found} hand box(es), {hit}/{n} frames softened, strength under a hand "
-               f"x{hand_strength}, min mask {float(pm[0].min()):.2f}")
+               f"x{hand_strength}{expr_note}, min mask {float(pm[0].min()):.2f}")
         print("[StacyLoop] " + rep)
         return (out, rep)
 
