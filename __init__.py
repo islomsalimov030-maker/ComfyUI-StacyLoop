@@ -1185,8 +1185,24 @@ class StacyRefVideo:
         p = os.path.join(folder_paths.get_input_directory(), video)
         return p if os.path.isfile(p) else None
 
+    @staticmethod
+    def _end_note(settings, prompt):
+        """<Picture 3> = the END FRAME image, given to H3 only for an entry clip (loop OFF + end_frame ON)."""
+        if not isinstance(settings, dict) or prompt is None:
+            return ""
+        end_ref = bool(settings.get("last_anchor")) and not bool(settings.get("loop"))
+        has = "<Picture 3>" in prompt
+        if end_ref and not has:
+            return ("\n  WARNING: end_frame is ON - the end frame image is <Picture 3>: add '<Picture 3> is the last "
+                    "frame of [Shot 1].' to the prompt (see the guide)")
+        if has and not end_ref:
+            return ("\n  WARNING: the prompt mentions <Picture 3> but there is no end frame (it is used only with "
+                    "loop OFF + end_frame ON) - remove it from the prompt")
+        return "\nend frame <Picture 3>: " + ("yes" if end_ref else "no")
+
     def run(self, video, start_sec=0.0, length_sec=0.0, settings=None, prompt=None):
         tag = prompt is not None and "<Video 1>" in prompt
+        end_note = self._end_note(settings, prompt)
         p = self._path(video)
         if p is None:
             if video and video != "(none)":
@@ -1194,7 +1210,7 @@ class StacyRefVideo:
             rep = "reference video <Video 1>: none"
             if tag:
                 rep += "\n  WARNING: the prompt mentions <Video 1> but no reference video is loaded - remove it from the prompt"
-            return (None, rep, False)
+            return (None, rep + end_note, False)
         import cv2
         gen_frames = int((settings or {}).get("length") or 362)
         loop = bool((settings or {}).get("loop", False))
@@ -1240,12 +1256,13 @@ class StacyRefVideo:
             rep += "\n  WARNING: shorter than 2 s - H3 is trained on 2-15 s references"
         if prompt is not None and not tag:
             rep += "\n  WARNING: the prompt does not mention <Video 1> - describe what to take from it (see the guide)"
+        rep += end_note
         print("[StacyLoop] " + rep)
         return (frames, rep, True)
 
 
 _PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "free_vram", "face_pass", "face_denoise_auto",
-                "face_denoise", "face_lora", "face_lock_temporal")
+                "face_denoise", "face_lora", "face_lock_temporal", "char_lora")
 _AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence")
 # tuned / always-AUTO knobs that are not on the panel any more (official H3 steps/shift; AUTO ones: value unused)
 _PANEL_FIXED = {"steps": 20, "shift": 12.0, "large_face_mult": 0.35, "hand_strength": 0.2, "face_lock": 1.0,
@@ -1281,6 +1298,8 @@ class StacyPanel:
                                    "adds nothing. on / off: forced."})
         req["free_vram"] = (_TRI, {"default": "auto", "tooltip": "auto: ON for GPUs up to 48 GB (24-32 GB cards need "
                                    "the memory for colour / RTX / face pass), OFF on bigger cards (faster)."})
+        req["char_lora"] = _sl("FLOAT", 1.0, 0.0, 1.5, 0.05, "Stacy character LoRA (stacy_h3_A_stills) strength in the "
+                               "GENERATION. 0 = off. Its trigger word is St4cy_H3 (put it in the prompt).")
         return {"required": {k: req[k] for k in _PANEL_ORDER}}
 
     RETURN_TYPES = ("STACY_SETTINGS",)
@@ -1289,6 +1308,7 @@ class StacyPanel:
     CATEGORY = CATEGORY
 
     def run(self, **kw):
+        char_lora = float(kw.pop("char_lora", 1.0))
         auto = {k: bool(kw.pop(k + "_auto", True)) for k in _AUTO_KNOBS}   # knobs not on the panel = always AUTO
         for k in ("face_pass", "free_vram"):
             v = kw.get(k, "auto")
@@ -1301,6 +1321,7 @@ class StacyPanel:
         vals = StacyControls().run(**kw)
         d = dict(zip(StacyControls.RETURN_NAMES, vals))
         d["_auto"] = auto
+        d["char_lora"] = char_lora
         return (d,)
 
 
@@ -1410,8 +1431,8 @@ class StacySettings:
                              "branch": (["generate", "face pass video"], {"default": "generate"})},
                 "optional": {"probe_image": ("IMAGE", {"lazy": True})}}
 
-    RETURN_TYPES = StacyControls.RETURN_TYPES + ("STRING",)
-    RETURN_NAMES = StacyControls.RETURN_NAMES + ("auto_report",)
+    RETURN_TYPES = StacyControls.RETURN_TYPES + ("STRING", "FLOAT", "BOOLEAN")
+    RETURN_NAMES = StacyControls.RETURN_NAMES + ("auto_report", "char_lora", "end_ref")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
@@ -1467,7 +1488,8 @@ class StacySettings:
         text = "AUTO SETTINGS\n" + ("\n".join(rep) if rep else "(all manual)")
         if rep:
             print("[StacyLoop] " + text.replace("\n", " | "))
-        return tuple(v[n] for n in StacyControls.RETURN_NAMES) + (text,)
+        end_ref = bool(v.get("last_anchor")) and not bool(v.get("loop"))   # entry clip with an end frame -> <Picture 3>
+        return tuple(v[n] for n in StacyControls.RETURN_NAMES) + (text, float(v.get("char_lora", 1.0)), end_ref)
 
 
 
