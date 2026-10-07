@@ -1134,6 +1134,116 @@ class StacyVideoInput:
         return (out, int(out.shape[0]), fps, rep)
 
 
+class StacyRefVideo:
+    """OPTIONAL motion / facial-expression reference for the generation = <Video 1> of the prompt.
+    '(none)' (default) = no reference: the generation works exactly as without this node.
+    A video here: it is resampled to 24 fps from start_sec, trimmed to the clip length (max 15 s) and fed to H3 as
+    <Video 1>. Only the MOVEMENT / EXPRESSION is meant to be taken from it - say so in the prompt (see the guide)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        d = folder_paths.get_input_directory()
+        files = []
+        for root, _, names in os.walk(d):
+            for n in names:
+                if n.lower().endswith(_VIDEO_EXT):
+                    files.append(os.path.relpath(os.path.join(root, n), d).replace(os.sep, "/"))
+        return {"required": {
+                    "video": (["(none)"] + sorted(files), {"video_upload": True,
+                              "tooltip": "Motion / expression reference (<Video 1>). '(none)' = no reference."}),
+                    "start_sec": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 0.1,
+                                  "tooltip": "Where in the reference video the movement starts (seconds)."}),
+                    "length_sec": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 15.0, "step": 0.25,
+                                   "tooltip": "How much of the reference to use. 0 = AUTO: the clip length, minus 2 s "
+                                              "in a LOOP (time to return to the keyframe pose at the end)."})},
+                "optional": {
+                    "settings": ("STACY_SETTINGS", {"tooltip": "The panel: the reference is trimmed to the clip length."}),
+                    "prompt": ("STRING", {"forceInput": True,
+                               "tooltip": "Generation prompt: the report warns if <Video 1> is missing / not loaded."})}}
+
+    RETURN_TYPES = ("IMAGE", "STRING", "BOOLEAN")
+    RETURN_NAMES = ("ref_video", "report", "has_video")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, video):
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, video, start_sec=0.0, length_sec=0.0, settings=None, prompt=None):
+        p = cls._path(video)
+        s = settings or {}
+        return f"{p}:{os.path.getmtime(p)}:{start_sec}:{length_sec}:{s.get('length')}:{s.get('loop')}" if p else "none"
+
+    @staticmethod
+    def _path(video):
+        import folder_paths
+        if not video or video == "(none)":
+            return None
+        p = os.path.join(folder_paths.get_input_directory(), video)
+        return p if os.path.isfile(p) else None
+
+    def run(self, video, start_sec=0.0, length_sec=0.0, settings=None, prompt=None):
+        tag = prompt is not None and "<Video 1>" in prompt
+        p = self._path(video)
+        if p is None:
+            if video and video != "(none)":
+                raise FileNotFoundError(f"StacyRefVideo: '{video}' not found in the input folder")
+            rep = "reference video <Video 1>: none"
+            if tag:
+                rep += "\n  WARNING: the prompt mentions <Video 1> but no reference video is loaded - remove it from the prompt"
+            return (None, rep, False)
+        import cv2
+        gen_frames = int((settings or {}).get("length") or 362)
+        loop = bool((settings or {}).get("loop", False))
+        if float(length_sec) > 0:
+            want, how = int(round(float(length_sec) * 24)) + 1, f"{float(length_sec):.2f} s (manual)"
+        else:
+            want = gen_frames - (48 if loop else 0)
+            how = "AUTO: clip length" + (" - 2 s for the loop return" if loop else "")
+        want = max(5, min(want, gen_frames, 15 * 24 + 1))
+        cap = cv2.VideoCapture(p)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or 24.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        first = int(round(float(start_sec) * fps))
+        if first:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first)
+        idx = [first + int(round(j * fps / 24.0)) for j in range(want)]
+        out, cur, k, size = [], first, 0, None
+        while k < len(idx):
+            ok, fr = cap.read()
+            if not ok:
+                break
+            while k < len(idx) and idx[k] == cur:
+                if size is None:
+                    h, w = fr.shape[:2]
+                    s = min(1.0, math.sqrt((1344 * 768) / float(w * h)))
+                    size = (max(16, int(round(w * s / 2)) * 2), max(16, int(round(h * s / 2)) * 2))
+                im = fr if size == (fr.shape[1], fr.shape[0]) else cv2.resize(fr, size, interpolation=cv2.INTER_AREA)
+                out.append(torch.from_numpy(cv2.cvtColor(im, cv2.COLOR_BGR2RGB)))
+                k += 1
+            cur += 1
+        cap.release()
+        n = len(out)
+        if n < 5:
+            raise ValueError(f"StacyRefVideo: only {n} frames after start_sec={start_sec} - need at least 2 s of video")
+        used = n
+        while used % 17 != 5:
+            used -= 1
+        frames = torch.stack(out[:used]).float().div_(255.0)
+        rep = (f"reference video <Video 1>: {os.path.basename(p)}  {fps:.2f} fps, {total / fps if total else 0:.1f} s source"
+               f"  -> {used} frames @24 fps = {used / 24.0:.2f} s from {float(start_sec):.1f} s, {size[0]}x{size[1]}"
+               f"  [{how}; clip {(gen_frames - 1) / 24.0:.2f} s]")
+        if used < 48:
+            rep += "\n  WARNING: shorter than 2 s - H3 is trained on 2-15 s references"
+        if prompt is not None and not tag:
+            rep += "\n  WARNING: the prompt does not mention <Video 1> - describe what to take from it (see the guide)"
+        print("[StacyLoop] " + rep)
+        return (frames, rep, True)
+
+
 _PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "free_vram", "face_pass", "face_denoise_auto",
                 "face_denoise", "face_lora", "face_lock_temporal")
 _AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence")
@@ -1644,6 +1754,7 @@ NODE_CLASS_MAPPINGS = {
     "StacyLoadVideo": StacyLoadVideo,
     "StacyColorLock": StacyColorLock,
     "StacyVideoInput": StacyVideoInput,
+    "StacyRefVideo": StacyRefVideo,
     "StacyPanel": StacyPanel,
     "StacySettings": StacySettings,
 }
@@ -1670,6 +1781,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StacyLoadVideo": "Stacy · Load ready video (by name)",
     "StacyColorLock": "Stacy · Colour lock to keyframe (low VRAM)",
     "StacyVideoInput": "Stacy · Video for face pass (upload)",
+    "StacyRefVideo": "Stacy · Motion / expression reference <Video 1> (optional)",
     "StacyPanel": "Stacy · PANEL (all knobs)",
     "StacySettings": "Stacy · Settings (unpack)",
 }
