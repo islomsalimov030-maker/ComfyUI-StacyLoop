@@ -2,7 +2,7 @@ import { app } from "../../scripts/app.js";
 
 // Stacy PANEL: grey out the knobs that do not apply to the current mode / are set to AUTO.
 // 'loop' stays active in both modes: the face pass of a ready video also needs to know if it is a loop.
-const GEN = ["duration_sec", "end_frame", "free_vram", "face_pass"];
+const GEN = ["duration_sec", "end_frame", "free_vram", "face_pass", "char_lora"];
 const FACE = ["face_denoise_auto", "face_denoise", "face_lora", "face_lock_temporal"];
 const AUTO = ["face_denoise"];
 const WATCH = ["mode", "face_pass", "loop", ...AUTO.map((n) => n + "_auto")];
