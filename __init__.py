@@ -1261,12 +1261,15 @@ class StacyRefVideo:
         return (frames, rep, True)
 
 
-_PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "free_vram", "face_pass", "face_denoise_auto",
-                "face_denoise", "face_lora", "face_lock_temporal", "char_lora")
+_PANEL_ORDER = ("mode", "seed", "duration_sec", "loop", "end_frame", "model_10eros", "steps", "shift", "char_lora",
+                "free_vram", "face_pass", "face_denoise_auto", "face_denoise", "face_lora", "face_lock_temporal")
 _AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather", "face_confidence")
-# tuned / always-AUTO knobs that are not on the panel any more (official H3 steps/shift; AUTO ones: value unused)
+# tuned / always-AUTO knobs that are not on the panel any more (AUTO ones: value unused)
 _PANEL_FIXED = {"steps": 20, "shift": 12.0, "large_face_mult": 0.35, "hand_strength": 0.2, "face_lock": 1.0,
                 "crop_factor": 2.5, "color_lock": 1.0, "seam_crossfade": 8, "stitch_feather": 24, "face_confidence": 0.35}
+# recommended sampling per generation model (steps, shift): Singularity ref2va = official non-turbo H3 scheme,
+# 10Eros TURBO-hybrid = turbo baked in, few steps
+_MODEL_RECO = {False: ("Singularity ref2va", 20, 12.0), True: ("10Eros Max TURBO-hybrid beta4", 8, 12.0)}
 _TRI = ["auto", "on", "off"]
 
 
@@ -1299,7 +1302,17 @@ class StacyPanel:
         req["free_vram"] = (_TRI, {"default": "auto", "tooltip": "auto: ON for GPUs up to 48 GB (24-32 GB cards need "
                                    "the memory for colour / RTX / face pass), OFF on bigger cards (faster)."})
         req["char_lora"] = _sl("FLOAT", 1.0, 0.0, 1.5, 0.05, "Stacy character LoRA (stacy_h3_A_stills) strength in the "
-                               "GENERATION. 0 = off. Its trigger word is St4cy_H3 (put it in the prompt).")
+                               "GENERATION. 0 = off. Its trigger word is St4cy_H3 (put it in the prompt). On 10Eros "
+                               "other LoRAs usually need less (0.2-0.6, author's note).")
+        req["model_10eros"] = ("BOOLEAN", {"default": False, "label_on": "10Eros Max TURBO beta4",
+                                           "label_off": "Singularity ref2va",
+                                           "tooltip": "Generation model. 10Eros = TURBO-hybrid (turbo baked in): steps "
+                                                      "8 (6-8), shift 12. Singularity ref2va (non-turbo): steps 20, "
+                                                      "shift 12."})
+        req["steps"] = _sl("INT", 20, 4, 30, 1, "Generation sampling steps (res_multistep). Singularity: 20 "
+                           "(official non-turbo scheme). 10Eros TURBO: 8 (6-8); more does not help a turbo model.")
+        req["shift"] = _sl("FLOAT", 12.0, 6.0, 12.0, 0.5, "Sigma shift (shift_video). 12 = official, holds the "
+                           "keyframe best. Lower (10-11) = more motion amplitude, but the pose/face drift more.")
         return {"required": {k: req[k] for k in _PANEL_ORDER}}
 
     RETURN_TYPES = ("STACY_SETTINGS",)
@@ -1309,7 +1322,8 @@ class StacyPanel:
 
     def run(self, **kw):
         char_lora = float(kw.pop("char_lora", 1.0))
-        auto = {k: bool(kw.pop(k + "_auto", True)) for k in _AUTO_KNOBS}   # knobs not on the panel = always AUTO
+        model_10eros = bool(kw.pop("model_10eros", False))
+        auto ={k: bool(kw.pop(k + "_auto", True)) for k in _AUTO_KNOBS}   # knobs not on the panel = always AUTO
         for k in ("face_pass", "free_vram"):
             v = kw.get(k, "auto")
             v = "on" if v is True else "off" if v is False else str(v)
@@ -1322,6 +1336,7 @@ class StacyPanel:
         d = dict(zip(StacyControls.RETURN_NAMES, vals))
         d["_auto"] = auto
         d["char_lora"] = char_lora
+        d["model_10eros"] = model_10eros
         return (d,)
 
 
@@ -1431,8 +1446,9 @@ class StacySettings:
                              "branch": (["generate", "face pass video"], {"default": "generate"})},
                 "optional": {"probe_image": ("IMAGE", {"lazy": True})}}
 
-    RETURN_TYPES = StacyControls.RETURN_TYPES + ("STRING", "FLOAT", "BOOLEAN")
-    RETURN_NAMES = StacyControls.RETURN_NAMES + ("auto_report", "char_lora", "end_ref")
+    # new outputs only ever go at the END: saved workflows address the outputs by slot index
+    RETURN_TYPES = StacyControls.RETURN_TYPES + ("STRING", "FLOAT", "BOOLEAN", "BOOLEAN")
+    RETURN_NAMES = StacyControls.RETURN_NAMES + ("auto_report", "char_lora", "end_ref", "model_10eros")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
@@ -1449,6 +1465,11 @@ class StacySettings:
 
     def run(self, settings, branch="generate", probe_image=None):
         v = dict(settings); a = settings.get("_auto", {}); rep = []
+        eros = bool(v.get("model_10eros", False))
+        if branch == "generate" and self._active(settings, branch):
+            name, st, sh = _MODEL_RECO[eros]
+            note = "" if (int(v["steps"]), float(v["shift"])) == (st, sh) else f" (recommended: steps {st}, shift {sh:g})"
+            rep.append(f"model: {name}, steps {int(v['steps'])}, shift {float(v['shift']):g}{note}")
         if a.get("free_vram"):
             try:
                 gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30 if torch.cuda.is_available() else 0
@@ -1489,7 +1510,7 @@ class StacySettings:
         if rep:
             print("[StacyLoop] " + text.replace("\n", " | "))
         end_ref = bool(v.get("last_anchor")) and not bool(v.get("loop"))   # entry clip with an end frame -> <Picture 3>
-        return tuple(v[n] for n in StacyControls.RETURN_NAMES) + (text, float(v.get("char_lora", 1.0)), end_ref)
+        return tuple(v[n] for n in StacyControls.RETURN_NAMES) + (text, float(v.get("char_lora", 1.0)), end_ref, eros)
 
 
 
