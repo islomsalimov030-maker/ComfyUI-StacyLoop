@@ -1267,9 +1267,9 @@ _AUTO_KNOBS = ("color_lock", "seam_crossfade", "face_denoise", "stitch_feather",
 # tuned / always-AUTO knobs that are not on the panel any more (AUTO ones: value unused)
 _PANEL_FIXED = {"steps": 20, "shift": 12.0, "large_face_mult": 0.35, "hand_strength": 0.2, "face_lock": 1.0,
                 "crop_factor": 2.5, "color_lock": 1.0, "seam_crossfade": 8, "stitch_feather": 24, "face_confidence": 0.35}
-# recommended sampling per generation model (steps, shift): Singularity ref2va = official non-turbo H3 scheme,
-# 10Eros TURBO-hybrid = turbo baked in, few steps
-_MODEL_RECO = {False: ("Singularity ref2va", 20, 12.0), True: ("10Eros Max TURBO-hybrid beta4", 8, 12.0)}
+# recommended sampling per generation model (steps, shift): both are non-turbo -> official H3 scheme
+# (the author's 4-8 step presets for 10Eros are for the TURBO files)
+_MODEL_RECO = {False: ("Singularity ref2va", 20, 12.0), True: ("10Eros Max hybrid beta5", 20, 12.0)}
 _TRI = ["auto", "on", "off"]
 
 
@@ -1304,13 +1304,12 @@ class StacyPanel:
         req["char_lora"] = _sl("FLOAT", 1.0, 0.0, 1.5, 0.05, "Stacy character LoRA (stacy_h3_A_stills) strength in the "
                                "GENERATION. 0 = off. Its trigger word is St4cy_H3 (put it in the prompt). On 10Eros "
                                "other LoRAs usually need less (0.2-0.6, author's note).")
-        req["model_10eros"] = ("BOOLEAN", {"default": False, "label_on": "10Eros Max TURBO beta4",
+        req["model_10eros"] = ("BOOLEAN", {"default": False, "label_on": "10Eros Max hybrid beta5",
                                            "label_off": "Singularity ref2va",
-                                           "tooltip": "Generation model. 10Eros = TURBO-hybrid (turbo baked in): steps "
-                                                      "8 (6-8), shift 12. Singularity ref2va (non-turbo): steps 20, "
-                                                      "shift 12."})
-        req["steps"] = _sl("INT", 20, 4, 30, 1, "Generation sampling steps (res_multistep). Singularity: 20 "
-                           "(official non-turbo scheme). 10Eros TURBO: 8 (6-8); more does not help a turbo model.")
+                                           "tooltip": "Generation model. Both are non-turbo: steps 20, shift 12. "
+                                                      "On 10Eros other LoRAs usually need 0.2-0.6 (author's note)."})
+        req["steps"] = _sl("INT", 20, 4, 30, 1, "Generation sampling steps (res_multistep). 20 = official non-turbo "
+                           "scheme for both models; fewer = faster but softer and slow-motion-prone.")
         req["shift"] = _sl("FLOAT", 12.0, 6.0, 12.0, 0.5, "Sigma shift (shift_video). 12 = official, holds the "
                            "keyframe best. Lower (10-11) = more motion amplitude, but the pose/face drift more.")
         return {"required": {k: req[k] for k in _PANEL_ORDER}}
