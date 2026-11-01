@@ -465,13 +465,26 @@ class StacyFlowAlign:
 
 
 _HAND_CACHE: dict = {}
+_MP_FALLBACK = {mp_detect.FACE: "face_yolov8m.pt", mp_detect.HAND: "hand_yolov8s.pt"}
+
+
+def _mp_or_none(name: str):
+    """MediaPipe detector, or None with a loud warning when MediaPipe cannot run on this machine
+    (e.g. the container has no libEGL / libGLESv2: apt install libegl1 libgles2)."""
+    try:
+        return mp_detect.load(name)
+    except Exception as e:
+        print(f"[StacyLoop] WARNING: MediaPipe '{name}' unavailable ({type(e).__name__}: {str(e)[:120]}) - "
+              f"falling back to {_MP_FALLBACK[name]} (Ultralytics, AGPL-3.0). Fix: apt install libegl1 libgles2")
+        return None
 
 
 def _load_yolo(name: str):
     if name in _HAND_CACHE:
         return _HAND_CACHE[name]
     if mp_detect.is_mediapipe(name):     # MediaPipe (Apache-2.0) instead of an Ultralytics (AGPL-3.0) model
-        _HAND_CACHE[name] = mp_detect.load(name)
+        m = _mp_or_none(name)
+        _HAND_CACHE[name] = m if m is not None else _load_yolo(_MP_FALLBACK[name])
         return _HAND_CACHE[name]
     import os
     path = None
@@ -1385,12 +1398,10 @@ def _face_model(detector=YOLO_FACE):
     """The face pass's own detector (face_yolov8m.pt via ultralytics, or MediaPipe), cached; (model, '') or
     (None, reason)."""
     if mp_detect.is_mediapipe(detector):
-        try:
-            if detector not in _FACE_DET:
-                _FACE_DET[detector] = mp_detect.load(detector)
+        if detector not in _FACE_DET:
+            _FACE_DET[detector] = _mp_or_none(detector)
+        if _FACE_DET[detector] is not None:
             return _FACE_DET[detector], ""
-        except Exception as e:
-            return None, f"face detector {detector} failed ({type(e).__name__}: {str(e)[:80]})"
     try:
         import folder_paths
         if "m" not in _FACE_DET:
@@ -1440,7 +1451,9 @@ class StacyAutoConfidence:
         if conf < 0:
             import numpy as np
             m, why = _face_model(detector)
-            ts = _AUTO_CONF["mediapipe" if mp_detect.is_mediapipe(detector) else "yolo"]
+            used = detector if isinstance(m, mp_detect.MPDetector) else YOLO_FACE   # MediaPipe may fall back
+            ts = _AUTO_CONF["mediapipe" if used != YOLO_FACE else "yolo"]
+            detector = used
             T = images.shape[0]
             if m is None:
                 conf, rep = ts[0], f"face_confidence: auto -> {ts[0]:.2f} ({why})"
@@ -1504,7 +1517,11 @@ class StacyFaceTrackCrop:
         if m is None:
             raise RuntimeError("StacyFaceTrackCrop needs ComfyUI-H3-FaceRefine (H3 Face Track + Crop) installed")
         if mp_detect.is_mediapipe(detector) and detector not in m._DETECTOR_CACHE:
-            m._DETECTOR_CACHE[detector] = mp_detect.load(detector)
+            d = _mp_or_none(detector)
+            if d is None:
+                detector = _MP_FALLBACK[detector]
+            else:
+                m._DETECTOR_CACHE[detector] = d
         return m.H3FaceTrackCrop().run(detector=detector, **kw)
 
 
