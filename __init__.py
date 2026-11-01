@@ -1466,8 +1466,12 @@ class StacyAutoConfidence:
 def _facerefine():
     """Loaded module of ComfyUI-H3-FaceRefine (H3FaceTrackCrop), whatever its install folder is called."""
     import sys
+    import types
     for m in list(sys.modules.values()):
-        if getattr(m, "H3FaceTrackCrop", None) is not None and hasattr(m, "_DETECTOR_CACHE")                 and hasattr(m, "_detector_list"):
+        # vars(), not getattr: torch.ops-style namespaces answer any attribute
+        d = vars(m) if isinstance(m, types.ModuleType) else {}
+        if isinstance(d.get("H3FaceTrackCrop"), type) and isinstance(d.get("_DETECTOR_CACHE"), dict) \
+                and callable(d.get("_detector_list")):
             return m
     return None
 
