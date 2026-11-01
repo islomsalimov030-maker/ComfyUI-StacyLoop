@@ -22,6 +22,8 @@ Nodes
                          left patches of the raw video), LOWER the face pass strength under the hand, softly in
                          space and time, inside the latent noise mask (after H3PerFrameDenoise). The hand is
                          barely touched, the rest of the face gets the full pass, nothing pops
+  StacyFaceTrackCrop     H3 Face Track + Crop (ComfyUI-H3-FaceRefine) with the MediaPipe face detector (Apache-2.0)
+                         instead of face_yolov8m.pt; hand_model "mediapipe_hand" does the same for the hand guard
   StacyHandMask          face-pass paste mask that leaves HANDS alone: the face rect (canvas space, from the
                          H3 face-track transform) minus every detected hand (YOLO hand detector), grown and
                          held over neighbouring frames. A hand in front of the face keeps its original pixels
@@ -36,6 +38,8 @@ import os
 
 import torch
 import torch.nn.functional as F
+
+from . import mp_detect
 
 CATEGORY = "StacyLoop"
 
@@ -466,6 +470,9 @@ _HAND_CACHE: dict = {}
 def _load_yolo(name: str):
     if name in _HAND_CACHE:
         return _HAND_CACHE[name]
+    if mp_detect.is_mediapipe(name):     # MediaPipe (Apache-2.0) instead of an Ultralytics (AGPL-3.0) model
+        _HAND_CACHE[name] = mp_detect.load(name)
+        return _HAND_CACHE[name]
     import os
     path = None
     try:
@@ -574,7 +581,11 @@ class StacyHandMask:
 
 
 def _hand_boxes(crops, hand_model, confidence):
-    model = _load_yolo(hand_model)
+    try:
+        model = _load_yolo(hand_model)
+    except Exception as e:                          # never break the face pass over the hand guard
+        print(f"[StacyLoop] hand detector '{hand_model}' failed: {str(e)[:200]}")
+        model = None
     if model is None:
         return None
     n = int(crops.shape[0])
@@ -1342,12 +1353,19 @@ class StacyPanel:
 _FACE_DET = {}
 
 
-def _face_height(img):
+YOLO_FACE = "face_yolov8m.pt"
+FACE_DETECTORS = [YOLO_FACE, mp_detect.FACE]
+# AUTO face_confidence: candidate thresholds per detector family (highest first). BlazeFace scores sit higher
+# than face_yolov8m ones for the same faces (measured on Stacy frames, WS-15 01.11).
+_AUTO_CONF = {"yolo": (0.35, 0.30, 0.25, 0.20), "mediapipe": (0.50, 0.40, 0.30, 0.20)}
+
+
+def _face_height(img, detector=YOLO_FACE):
     """Height in px (scaled to a 1080-px tall frame) of the largest face on the first frame, or (None, reason).
-    Uses the same detector as the face pass (face_yolov8m.pt via ultralytics)."""
+    Uses the same detector as the face pass (face_yolov8m.pt via ultralytics, or MediaPipe)."""
     try:
         import numpy as np
-        m, why = _face_model()
+        m, why = _face_model(detector)
         if m is None:
             return None, why
         f = img[0, ..., :3].clamp(0, 1).cpu().numpy()
@@ -1363,8 +1381,16 @@ def _face_height(img):
         return None, f"face detector failed ({type(e).__name__}: {str(e)[:80]})"
 
 
-def _face_model():
-    """The face pass's own detector (face_yolov8m.pt via ultralytics), cached; (model, '') or (None, reason)."""
+def _face_model(detector=YOLO_FACE):
+    """The face pass's own detector (face_yolov8m.pt via ultralytics, or MediaPipe), cached; (model, '') or
+    (None, reason)."""
+    if mp_detect.is_mediapipe(detector):
+        try:
+            if detector not in _FACE_DET:
+                _FACE_DET[detector] = mp_detect.load(detector)
+            return _FACE_DET[detector], ""
+        except Exception as e:
+            return None, f"face detector {detector} failed ({type(e).__name__}: {str(e)[:80]})"
     try:
         import folder_paths
         if "m" not in _FACE_DET:
@@ -1398,39 +1424,84 @@ class StacyAutoConfidence:
     def INPUT_TYPES(cls):
         return {"required": {"images": ("IMAGE",), "confidence": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0,
                                                                            "step": 0.05})},
-                "optional": {"prev_report": ("STRING", {"forceInput": True})}}
+                "optional": {"prev_report": ("STRING", {"forceInput": True}),
+                             "detector": (FACE_DETECTORS, {"default": YOLO_FACE, "tooltip": "The SAME detector as the "
+                                          "face tracker (thresholds differ per detector). mediapipe_face = "
+                                          "MediaPipe BlazeFace (Apache-2.0); face_yolov8m.pt = Ultralytics (AGPL-3.0)."})}}
 
     RETURN_TYPES = ("FLOAT", "STRING")
     RETURN_NAMES = ("confidence", "report")
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, images, confidence, prev_report=None):
+    def run(self, images, confidence, prev_report=None, detector=YOLO_FACE):
         conf = float(confidence)
         rep = f"face_confidence: {conf:.2f}"
         if conf < 0:
             import numpy as np
-            m, why = _face_model()
+            m, why = _face_model(detector)
+            ts = _AUTO_CONF["mediapipe" if mp_detect.is_mediapipe(detector) else "yolo"]
             T = images.shape[0]
             if m is None:
-                conf, rep = 0.35, f"face_confidence: auto -> 0.35 ({why})"
+                conf, rep = ts[0], f"face_confidence: auto -> {ts[0]:.2f} ({why})"
             else:
                 idx = sorted(set(np.linspace(0, T - 1, min(T, 32)).round().astype(int).tolist()))
                 best = []
                 for i in idx:
                     f = images[i, ..., :3].clamp(0, 1).cpu().numpy()
                     bgr = (f * 255).astype(np.uint8)[..., ::-1].copy()
-                    r = m(bgr, conf=0.15, verbose=False)[0]
+                    r = m(bgr, conf=min(0.15, ts[-1]), verbose=False)[0]
                     best.append(float(r.boxes.conf.max()) if r.boxes is not None and len(r.boxes) else 0.0)
                 best = np.array(best)
-                cov = {t: float((best >= t).mean()) for t in (0.35, 0.30, 0.25, 0.20)}
-                conf = next((t for t in (0.35, 0.30, 0.25, 0.20) if cov[t] >= 0.9), 0.20)
-                rep = (f"face_confidence: auto -> {conf:.2f} (face found on {100 * cov[conf]:.0f}% of {len(idx)} "
-                       f"sampled frames; at 0.35: {100 * cov[0.35]:.0f}%)")
+                cov = {t: float((best >= t).mean()) for t in ts}
+                conf = next((t for t in ts if cov[t] >= 0.9), ts[-1])
+                rep = (f"face_confidence: auto -> {conf:.2f} ({detector}; face found on {100 * cov[conf]:.0f}% of "
+                       f"{len(idx)} sampled frames; at {ts[0]:.2f}: {100 * cov[ts[0]]:.0f}%)")
         if prev_report:
             rep = prev_report + "\n" + rep
         print("[StacyLoop] " + rep.replace("\n", " | "))
         return (conf, rep)
+
+
+def _facerefine():
+    """Loaded module of ComfyUI-H3-FaceRefine (H3FaceTrackCrop), whatever its install folder is called."""
+    import sys
+    for m in list(sys.modules.values()):
+        if getattr(m, "H3FaceTrackCrop", None) is not None and hasattr(m, "_DETECTOR_CACHE")                 and hasattr(m, "_detector_list"):
+            return m
+    return None
+
+
+class StacyFaceTrackCrop:
+    """H3 Face Track + Crop (ComfyUI-H3-FaceRefine, MIT) with a commercially clean face detector: 'mediapipe_face'
+    (MediaPipe BlazeFace, Apache-2.0) instead of face_yolov8m.pt (Ultralytics, AGPL-3.0). Same inputs, outputs and
+    behaviour as the original node (it runs the original code); YOLO files in the list still work as before.
+    Keep identity_track OFF (or identity_model != insightface): InsightFace weights are non-commercial."""
+
+    RETURN_TYPES = ("IMAGE", "H3FACEXFORM", "IMAGE", "STRING", "INT", "INT", "INT")
+    RETURN_NAMES = ("crops", "transform", "preview", "report", "canvas_w", "canvas_h", "frame_count")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import copy
+        m = _facerefine()
+        if m is None:
+            return {"required": {"images": ("IMAGE",), "detector": ([mp_detect.FACE],)}}
+        it = copy.deepcopy(m.H3FaceTrackCrop.INPUT_TYPES())
+        dets = [mp_detect.FACE] + [d for d in it["required"]["detector"][0] if d != mp_detect.FACE]
+        it["required"]["detector"] = (dets, {"default": mp_detect.FACE, "tooltip": "mediapipe_face — MediaPipe "
+                                             "BlazeFace (Apache-2.0); *.pt — Ultralytics YOLO (AGPL-3.0)."})
+        return it
+
+    def run(self, detector, **kw):
+        m = _facerefine()
+        if m is None:
+            raise RuntimeError("StacyFaceTrackCrop needs ComfyUI-H3-FaceRefine (H3 Face Track + Crop) installed")
+        if mp_detect.is_mediapipe(detector) and detector not in m._DETECTOR_CACHE:
+            m._DETECTOR_CACHE[detector] = mp_detect.load(detector)
+        return m.H3FaceTrackCrop().run(detector=detector, **kw)
 
 
 class StacySettings:
@@ -1443,7 +1514,9 @@ class StacySettings:
     def INPUT_TYPES(cls):
         return {"required": {"settings": ("STACY_SETTINGS",),
                              "branch": (["generate", "face pass video"], {"default": "generate"})},
-                "optional": {"probe_image": ("IMAGE", {"lazy": True})}}
+                "optional": {"probe_image": ("IMAGE", {"lazy": True}),
+                             "face_detector": (FACE_DETECTORS, {"default": YOLO_FACE, "tooltip": "Detector for the AUTO "
+                                               "face size (face pass / face denoise): the same as the face tracker."})}}
 
     # new outputs only ever go at the END: saved workflows address the outputs by slot index
     RETURN_TYPES = StacyControls.RETURN_TYPES + ("STRING", "FLOAT", "BOOLEAN", "BOOLEAN")
@@ -1455,14 +1528,14 @@ class StacySettings:
     def _active(settings, branch):
         return bool(settings.get("generate" if branch == "generate" else "video_mode"))
 
-    def check_lazy_status(self, settings, branch="generate", probe_image=None):
+    def check_lazy_status(self, settings, branch="generate", probe_image=None, face_detector=YOLO_FACE):
         a = settings.get("_auto", {}) if isinstance(settings, dict) else {}
         face_auto = a.get("face_denoise") or a.get("stitch_feather") or (branch == "generate" and a.get("face_pass"))
         if probe_image is None and face_auto and self._active(settings, branch):
             return ["probe_image"]
         return []
 
-    def run(self, settings, branch="generate", probe_image=None):
+    def run(self, settings, branch="generate", probe_image=None, face_detector=YOLO_FACE):
         v = dict(settings); a = settings.get("_auto", {}); rep = []
         eros = bool(v.get("model_10eros", False))
         if branch == "generate" and self._active(settings, branch):
@@ -1484,7 +1557,7 @@ class StacySettings:
             v["face_confidence"] = -1.0
         face_auto = a.get("face_denoise") or a.get("stitch_feather") or (branch == "generate" and a.get("face_pass"))
         if face_auto and self._active(settings, branch):
-            h, why = _face_height(probe_image) if probe_image is not None else (None, "no probe image")
+            h, why = _face_height(probe_image, face_detector) if probe_image is not None else (None, "no probe image")
             canvas_face = 768.0 / max(float(v["crop_factor"]), 1e-3)   # face height that fills the 768 canvas
             src = "keyframe" if branch == "generate" else "first video frame"
             rep.append(f"face on the {src}: " + (f"{h:.0f} px tall (FullHD scale); face-pass canvas fits a "
@@ -1774,6 +1847,7 @@ class StacyModelByMode:
         return (generate_model if settings.get("generate", True) else face_pass_video_model,)
 
 NODE_CLASS_MAPPINGS = {
+    "StacyFaceTrackCrop": StacyFaceTrackCrop,
     "StacyModelByMode": StacyModelByMode,
     "StacyAutoConfidence": StacyAutoConfidence,
     "StacyTemporalStabilize": StacyTemporalStabilize,
@@ -1801,6 +1875,7 @@ NODE_CLASS_MAPPINGS = {
     "StacySettings": StacySettings,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "StacyFaceTrackCrop": "Stacy · H3 Face Track + Crop (MediaPipe detector)",
     "StacyModelByMode": "Stacy · Model of the active mode (for preview)",
     "StacyAutoConfidence": "Stacy · Face detector threshold (AUTO)",
     "StacyTemporalStabilize": "Stacy · Stabilize static areas (anti-shimmer)",

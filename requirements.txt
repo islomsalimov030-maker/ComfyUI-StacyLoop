@@ -1,2 +1,3 @@
 opencv-python-headless
-ultralytics
+mediapipe
+ultralytics  # only for the legacy *.pt detectors (AGPL-3.0); mediapipe_face / mediapipe_hand do not need it
